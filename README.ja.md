@@ -4,6 +4,10 @@ Claude Code・Codex CLIを、プロジェクトごとの[Apple container](https:
 
 [English](README.md) · 日本語
 
+> **Toyプロジェクト／実験的なプロトタイプです。** 個人の実験・学習用で、本番利用を想定していません。第三者によるセキュリティ監査は受けておらず、本番環境のセキュリティ境界として信頼しないでください。破棄できるプロジェクト・アカウントで試し、機密データや本番用の認証情報は避けてください。動作やCLIの互換性は予告なく変わる場合があります。
+
+Apple・Anthropic・OpenAIによる公式提供・推奨ではない、独立したコミュニティプロジェクトです。
+
 ```sh
 cd /path/to/your/project
 jail claude
@@ -362,5 +366,7 @@ python3 scripts/protocol-smoke-test.py
 `JAIL_HOME`でホストの管理状態・ビルド用ディレクトリ（通常は`~/.local/share/jail`）を変更できます。`JAIL_CONTAINER_BIN`はテスト用のbackend実行ファイルを指定します。変更した動作のテストを追加し、英語・日本語のREADMEを合わせて更新してください。予定する作業は[TODO.md](TODO.md)で管理しています。
 
 ## ライセンス
+
+MITライセンスの対象はjail自身のソースコードです。コンテナの構築時にダウンロードするCLIなど、第三者のツール・依存ライブラリにはそれぞれのライセンス・利用条件が適用されます。このリポジトリにはそれらの実行バイナリを含めていません。
 
 [MIT](LICENSE) © 2026 jail contributors.

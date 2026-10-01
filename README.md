@@ -4,6 +4,10 @@ Run Claude Code and Codex CLI in project-scoped [Apple containers](https://githu
 
 English · [日本語](README.ja.md)
 
+> **Toy project / experimental prototype.** Built for personal experimentation and learning, not production use. It has not undergone an independent security audit and must not be relied on as a production security boundary. Use disposable projects and accounts; avoid sensitive data or production credentials. Behavior and CLI compatibility may change without notice.
+
+This is an independent community project, not affiliated with or endorsed by Apple, Anthropic, or OpenAI.
+
 ```sh
 cd /path/to/your/project
 jail claude
@@ -362,5 +366,7 @@ The host entry point is [src/main.rs](src/main.rs); runtime management is in [sr
 `JAIL_HOME` overrides the host state/build directory, normally `~/.local/share/jail`. `JAIL_CONTAINER_BIN` selects a backend executable for testing. For contributions, add tests for changed behavior and keep the English and Japanese READMEs aligned. Planned work is tracked in [TODO.md](TODO.md).
 
 ## License
+
+The MIT license applies to jail's own source code. Third-party tools and dependencies, including CLIs downloaded when building the container image, retain their own licenses and terms. This repository does not include their executable binaries.
 
 [MIT](LICENSE) © 2026 jail contributors.
