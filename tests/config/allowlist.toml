@@ -1,0 +1,9 @@
+[auth]
+import_host = false
+[resources]
+cpus = 2
+memory = "2G"
+[network]
+mode = "allowlist"
+allowed_hosts = ["example.com"]
+allowed_ports = [443]

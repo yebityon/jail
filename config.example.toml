@@ -1,0 +1,69 @@
+# Global trusted config: ~/.config/jail/config.toml
+# A repo's config is never loaded automatically. Relative mount sources resolve
+# against this file's directory. CLI arguments go after claude/codex.
+
+[resources]
+cpus = 4
+memory = "4G"
+
+[workspace]
+read_only = false
+# Relative paths within the project to hide at the VM mount boundary.
+hidden = []
+# Read-only mount boundaries protect sensitive project configuration by default.
+# Missing targets become host-visible placeholders. Disable only in trusted config.
+protect_sensitive = true
+# Extra project-relative protected paths; use a trailing / for missing directories.
+deny_write = []
+# Additional host directories are explicit and read-only by default.
+# [[workspace.mounts]]
+# source = "/Users/you/reference"
+# target = "/extra/reference"
+# read_only = true
+
+[network]
+# open: unrestricted outbound; none: no agent traffic; allowlist: HTTPS CONNECT
+# proxy + firewall that blocks ALL direct agent traffic (including DNS/IPv6).
+mode = "open"
+allowed_hosts = []
+allowed_ports = [443]
+allow_private_ips = false
+# TCP forwarding on Mac IPv4 localhost only. Set [] to disable. In none mode,
+# these ports are not published. Server must listen on 0.0.0.0, not 127.0.0.1.
+published_ports = [3000, 5173, 8000, 8080]
+# If occupied on first creation, allocate another host port; status/tail show it.
+auto_port = true
+# Starter list for allowlist mode; required hosts can vary by account/features:
+# allowed_hosts = ["api.anthropic.com", "claude.ai", "platform.claude.com",
+#                  "chatgpt.com", "auth.openai.com", "api.openai.com"]
+
+[tools]
+# AI tool availability is defense in depth, not a syscall security boundary.
+shell = true
+# false also makes every shared host mount read-only, so shell cannot bypass it.
+edit = true
+web_search = true
+mcp = false
+hooks = false
+# Additional native restrictions, for example ["Bash(git push *)", "WebFetch"].
+claude_deny = []
+# Use names supported by the pinned Codex version; unknown names fail startup.
+codex_disabled_features = []
+
+[auth]
+# Subscription OAuth only, held by root-only gateway in tmpfs. CLI sees placeholders.
+# Host settings/skills/MCP/history are not copied. No API keys are supported.
+import_host = true
+
+[lifecycle]
+auto_stop = false
+
+[image]
+claude_version = "2.1.284"
+codex_version = "0.159.2"
+
+[environment]
+# API keys, OAuth tokens and authentication endpoint overrides are reserved.
+pass = []
+# Static values. Never put secrets here. Proxy/home/runtime variables are reserved.
+set = {}

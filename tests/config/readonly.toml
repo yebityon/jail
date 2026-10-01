@@ -1,0 +1,7 @@
+[auth]
+import_host = false
+[resources]
+cpus = 2
+memory = "2G"
+[tools]
+edit = false
