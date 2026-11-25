@@ -1,9 +1,11 @@
 mod auth;
 mod backend;
+mod cleanup;
 mod monitor;
 mod policy_cli;
 mod project;
 mod runtime;
+mod terminal;
 mod write_guard;
 
 use anyhow::{bail, Context, Result};
@@ -46,6 +48,7 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Action>,
 }
+
 #[derive(Subcommand)]
 enum Action {
     #[command(about = "Live dashboard; Ctrl+C exits monitoring without stopping containers")]
@@ -89,6 +92,19 @@ enum Action {
     },
     #[command(about = "Rebuild the configured image; use recreate to switch existing containers")]
     Update,
+    #[command(
+        about = "List jail home volumes and images; delete named ones, or all with --all-delete, if no container uses them",
+        args_conflicts_with_subcommands = true
+    )]
+    Cleanup {
+        #[arg(
+            long,
+            help = "Delete every jail home volume and image that no container uses, without confirmation"
+        )]
+        all_delete: bool,
+        #[command(subcommand)]
+        target: Option<cleanup::Target>,
+    },
     #[command(external_subcommand)]
     Tool(Vec<OsString>),
 }
@@ -331,6 +347,9 @@ fn run(mut cli: Cli) -> Result<i32> {
             runtime::build(&backend, &data, &cfg, true)?;
             return Ok(0);
         }
+        Action::Cleanup { all_delete, target } => {
+            return cleanup::run(target, all_delete, &backend, &data, &project, &image);
+        }
         _ => {}
     }
     backend.ensure_service()?;
@@ -349,12 +368,13 @@ fn run(mut cli: Cli) -> Result<i32> {
     if let Action::Auth { tool } = &action {
         FileExt::try_lock_exclusive(&sessions)
             .context("close active sessions before re-importing authentication")?;
-        auth::import(&backend, &record, tool, true)?;
+        auth::import(&backend, &record, &data, tool, true)?;
         return Ok(0);
     }
     let (tool, agent_args) = launch.context("unsupported command")?;
-    if tool != "shell" && cfg.auth.import_host && import_login {
-        auth::import(&backend, &record, &tool, false)?;
+    let sync_login = tool != "shell" && cfg.auth.import_host && import_login;
+    if sync_login {
+        auth::import(&backend, &record, &data, &tool, false)?;
     }
     drop(mutation);
     let mut args = vec!["exec".to_owned(), "--interactive".into()];
@@ -375,12 +395,14 @@ fn run(mut cli: Cli) -> Result<i32> {
         record.id.clone(),
         "/usr/local/bin/jail-guest".into(),
         "launch".into(),
-        tool,
+        tool.clone(),
     ]);
     args.extend(agent_args);
     let mut command = backend.command(&args);
     let auto_stop = cli.auto_stop || cfg.lifecycle.auto_stop;
-    if !auto_stop {
+    let interactive_login =
+        tool != "shell" && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    if !auto_stop && !interactive_login && !sync_login {
         // The container client owns the terminal. Retain the shared session lock
         // across exec so stop/recreate cannot race an active client.
         let fd = sessions.as_raw_fd();
@@ -392,7 +414,19 @@ fn run(mut cli: Cli) -> Result<i32> {
         }
         return Err(command.exec().into());
     }
-    let result = wait_with_signals(&mut command);
+    // The host process stays alive for the session so host refreshes reach it.
+    let watch = sync_login.then(|| auth::watch(&record, &data, &tool));
+    let result = if interactive_login {
+        terminal::run(&mut command, || auth::refuse_login(&tool, sync_login))
+    } else {
+        wait_with_signals(&mut command)
+    };
+    if let Some(e) = watch.and_then(auth::Watch::finish) {
+        eprintln!("jail: could not sync refreshed host login: {e:#}");
+    }
+    if !auto_stop {
+        return result;
+    }
     drop(sessions);
     let mutation = project::lock(&data, &project.id, "lifecycle")?;
     FileExt::lock_exclusive(&mutation)?;

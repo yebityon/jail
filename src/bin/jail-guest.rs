@@ -37,6 +37,7 @@ fn run() -> Result<()> {
             Ok(())
         }
         Some("import-auth") => import_auth(&args.next().context("missing tool")?),
+        Some("sync-auth") => sync_auth(&args.next().context("missing tool")?),
         Some("prepare-auth") => prepare_auth(),
         Some("policy-log") => {
             println!("{}", serde_json::to_string(&network_policy::journal()?)?);
@@ -338,16 +339,39 @@ fn auth_path(tool: &str) -> Result<PathBuf> {
         _ => bail!("unsupported auth tool"),
     }
 }
-fn import_auth(tool: &str) -> Result<()> {
-    let path = auth_path(tool)?;
-    let (uid, gid) = identity()?;
+fn read_auth() -> Result<serde_json::Value> {
     let mut bytes = vec![];
     std::io::stdin().take(1024 * 1024).read_to_end(&mut bytes)?;
     let value: serde_json::Value = serde_json::from_slice(&bytes)?;
     if !value.is_object() {
         bail!("authentication must be an object");
     }
+    Ok(value)
+}
+fn import_auth(tool: &str) -> Result<()> {
+    let path = auth_path(tool)?;
+    let (uid, gid) = identity()?;
+    let value = read_auth()?;
     gateway::import(tool, &value)?;
+    drop_privileges(uid, gid)?;
+    secure_write(
+        &path,
+        &serde_json::to_vec(&gateway::placeholder(tool, &value))?,
+        0o600,
+    )
+}
+fn sync_auth(tool: &str) -> Result<()> {
+    if unsafe { libc::geteuid() } != 0 {
+        bail!("authentication update requires root");
+    }
+    let path = auth_path(tool)?;
+    let (uid, gid) = identity()?;
+    let value = read_auth()?;
+    // Concurrent hosts and sessions may send stale copies; the gateway keeps
+    // the later credential and leaves agent files alone when nothing changed.
+    if !gateway::sync(tool, &value)? {
+        return Ok(());
+    }
     drop_privileges(uid, gid)?;
     secure_write(
         &path,

@@ -123,6 +123,16 @@ pub fn ensure(
     // Other host apps can still race the final bind; the backend must fail safely.
     let allocation = project::lock(data, "port-forwarding", "allocation")?;
     FileExt::lock_exclusive(&allocation)?;
+    // jail cleanup may have removed the image after the build. Never let the
+    // backend resolve a missing local tag from a registry instead.
+    if !backend
+        .command(&["image", "inspect", &image])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+    {
+        bail!("image {image} was removed during launch; retry");
+    }
     let id = if let Some(record) = &existing {
         record.id.clone() // Retry a failed creation using the saved name.
     } else {
@@ -146,7 +156,14 @@ pub fn ensure(
         .map(|o| o.status.success())
         .unwrap_or(false)
     {
-        backend.checked(&["volume", "create", &volume])?;
+        // The label lets jail cleanup name the project after its state is gone.
+        backend.checked(&[
+            "volume".into(),
+            "create".into(),
+            "--label".into(),
+            format!("io.jail.project={}", project.root.display()),
+            volume.clone(),
+        ])?;
     }
     let requested = if cfg.network.mode == NetworkMode::None {
         &[][..]

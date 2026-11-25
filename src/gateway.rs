@@ -2,6 +2,7 @@
 //! Static upstreams, TLS verification, no redirects, no secret argv/environment.
 use crate::{network_policy, proxy};
 use anyhow::{bail, Context, Result};
+use fs2::FileExt;
 use serde_json::{json, Value};
 use std::{
     fs,
@@ -38,20 +39,84 @@ pub fn token(tool: &str, value: &Value) -> Result<String> {
     }
     Ok(token.into())
 }
+/// Serializes credential writers: explicit imports, /login and host sync.
+fn lock(tool: &str) -> Result<fs::File> {
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(PathBuf::from(PRIVATE).join(format!("{tool}.lock")))?;
+    FileExt::lock_exclusive(&file)?;
+    Ok(file)
+}
 pub fn import(tool: &str, value: &Value) -> Result<()> {
+    let _lock = lock(tool)?;
+    store(tool, value)
+}
+/// Host sync never replaces a later credential with an older copy, such as one
+/// another session read before a refresh. Returns whether the gateway changed.
+pub fn sync(tool: &str, value: &Value) -> Result<bool> {
+    token(tool, value)?;
+    let _lock = lock(tool)?;
+    let current: Option<Value> = match fs::read(credential_path(tool)?) {
+        Ok(bytes) => Some(serde_json::from_slice(&bytes)?),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e.into()),
+    };
+    if !newer(tool, current.as_ref(), value) {
+        return Ok(false);
+    }
+    store(tool, value)?;
+    Ok(true)
+}
+fn newer(tool: &str, current: Option<&Value>, incoming: &Value) -> bool {
+    let Some(current) = current else {
+        return true;
+    };
+    if token(tool, current).ok() == token(tool, incoming).ok() {
+        return false;
+    }
+    match (expiry(tool, current), expiry(tool, incoming)) {
+        (Some(current), Some(incoming)) => incoming > current,
+        (None, incoming) => incoming.is_some(),
+        (Some(_), None) => false,
+    }
+}
+/// Access-token expiry in Unix milliseconds. Codex states it only in the
+/// public `exp` claim of its JWT; the signature is not needed for ordering.
+fn expiry(tool: &str, value: &Value) -> Option<u64> {
+    if tool == "claude" {
+        return value["claudeAiOauth"]["expiresAt"].as_u64();
+    }
+    let payload = value["tokens"]["access_token"]
+        .as_str()?
+        .split('.')
+        .nth(1)?;
+    let claims: Value = serde_json::from_slice(&decode(payload)?).ok()?;
+    claims["exp"].as_u64()?.checked_mul(1000)
+}
+fn store(tool: &str, value: &Value) -> Result<()> {
     token(tool, value)?;
     let path = credential_path(tool)?;
-    let tmp = path.with_extension("new");
+    let tmp = path.with_extension(format!(
+        "{}-{}.new",
+        std::process::id(),
+        REQUEST.fetch_add(1, Ordering::Relaxed)
+    ));
+    let cleanup = BodyFile(tmp.clone());
     let mut f = fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&tmp)?;
     f.write_all(&serde_json::to_vec(value)?)?;
     f.sync_all()?;
     fs::rename(tmp, path)?;
+    drop(cleanup);
     Ok(())
 }
 fn base64(bytes: &[u8]) -> String {
@@ -72,11 +137,37 @@ fn base64(bytes: &[u8]) -> String {
     }
     out
 }
+fn decode(text: &str) -> Option<Vec<u8>> {
+    let mut bits = 0u32;
+    let mut count = 0;
+    let mut out = vec![];
+    for c in text.trim_end_matches('=').bytes() {
+        let value = match c {
+            b'A'..=b'Z' => c - b'A',
+            b'a'..=b'z' => c - b'a' + 26,
+            b'0'..=b'9' => c - b'0' + 52,
+            b'-' => 62,
+            b'_' => 63,
+            _ => return None,
+        };
+        bits = ((bits << 6) | value as u32) & 0xffff;
+        count += 6;
+        if count >= 8 {
+            count -= 8;
+            out.push((bits >> count) as u8);
+        }
+    }
+    Some(out)
+}
 pub fn placeholder(tool: &str, real: &Value) -> Value {
     if tool == "claude" {
-        let mut oauth = json!({"accessToken":"jail-proxy-placeholder", "refreshToken":"jail-proxy-placeholder", "expiresAt":4102444800000u64,
+        // No refreshToken: Claude Code also sends this token straight to
+        // api.anthropic.com (profile, bootstrap) and gets 401. With a refresh
+        // token it would refresh, fail, and clear this file ("Login expired").
+        let mut oauth = json!({"accessToken":"jail-proxy-placeholder", "expiresAt":4102444800000u64,
             "scopes":["user:inference","user:profile"]});
-        for key in ["subscriptionType", "rateLimitTier"] {
+        // Real scopes keep the plan shown and plan-dependent features enabled.
+        for key in ["subscriptionType", "rateLimitTier", "scopes"] {
             if let Some(v) = real["claudeAiOauth"].get(key) {
                 oauth[key] = v.clone();
             }
@@ -390,6 +481,27 @@ mod tests {
         }
     }
     #[test]
+    fn claude_placeholder_keeps_real_scopes() {
+        let scopes = json!([
+            "user:inference",
+            "user:profile",
+            "user:sessions:claude_code"
+        ]);
+        let real = json!({"claudeAiOauth":{"accessToken":"secret-access","scopes":scopes}});
+        assert_eq!(
+            placeholder("claude", &real)["claudeAiOauth"]["scopes"],
+            scopes
+        );
+        let real = json!({"claudeAiOauth":{"accessToken":"secret-access","refreshToken":"secret-refresh"}});
+        assert!(placeholder("claude", &real)["claudeAiOauth"]
+            .get("refreshToken")
+            .is_none());
+        assert_eq!(
+            placeholder("claude", &Value::Null)["claudeAiOauth"]["scopes"],
+            json!(["user:inference", "user:profile"])
+        );
+    }
+    #[test]
     fn route_and_method_are_fixed() {
         assert!(upstream("claude", "POST", "/v1/messages?beta=true").is_ok());
         assert!(upstream("codex", "POST", "/backend-api/codex/responses").is_ok());
@@ -404,5 +516,44 @@ mod tests {
         }
         assert!(upstream("claude", "CONNECT", "/v1/messages").is_err());
         assert_eq!(base64(b"hello"), "aGVsbG8");
+    }
+    #[test]
+    fn sync_keeps_the_later_login() {
+        for text in ["", "h", "he", "hel", "hello", "{\"exp\":1}"] {
+            assert_eq!(decode(&base64(text.as_bytes())).unwrap(), text.as_bytes());
+        }
+        assert!(decode("a+b").is_none());
+        let claude = |token: &str, at: Option<u64>| {
+            let mut oauth = json!({"accessToken": token});
+            if let Some(at) = at {
+                oauth["expiresAt"] = json!(at);
+            }
+            json!({"claudeAiOauth": oauth})
+        };
+        let old = claude("old", Some(1_000));
+        assert!(newer("claude", None, &old));
+        assert!(!newer("claude", Some(&old), &claude("old", Some(2_000))));
+        assert!(newer("claude", Some(&old), &claude("new", Some(2_000))));
+        assert!(!newer("claude", Some(&old), &claude("new", Some(500))));
+        assert!(!newer("claude", Some(&old), &claude("new", None)));
+        assert!(newer(
+            "claude",
+            Some(&claude("old", None)),
+            &claude("new", Some(1_000))
+        ));
+        let codex = |token: &str, exp: u64| {
+            let jwt = format!(
+                "e30.{}.sig",
+                base64(format!("{{\"exp\":{exp}}}").as_bytes())
+            );
+            json!({"tokens": {"access_token": format!("{jwt}{token}")}})
+        };
+        assert_eq!(expiry("codex", &codex("", 7)), Some(7_000));
+        assert!(newer("codex", Some(&codex("a", 7)), &codex("b", 8)));
+        assert!(!newer("codex", Some(&codex("a", 8)), &codex("b", 7)));
+        assert_eq!(
+            expiry("codex", &json!({"tokens": {"access_token": "opaque"}})),
+            None
+        );
     }
 }
