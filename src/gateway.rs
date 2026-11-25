@@ -1,6 +1,6 @@
 //! OAuth-only credential injection. Agents see placeholders, never real tokens.
 //! Static upstreams, TLS verification, no redirects, no secret argv/environment.
-use crate::{network_policy, proxy};
+use crate::{network_policy, proxy, PRIVATE};
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use serde_json::{json, Value};
@@ -18,7 +18,17 @@ use std::{
     time::Duration,
 };
 
-pub const PRIVATE: &str = "/run/jail-private";
+/// Loopback ports of the gateways inside the container.
+pub const CLAUDE_PORT: u16 = 3130;
+pub const CODEX_PORT: u16 = 3131;
+/// ANTHROPIC_BASE_URL for Claude Code.
+pub fn claude_url() -> String {
+    format!("http://127.0.0.1:{CLAUDE_PORT}")
+}
+/// chatgpt_base_url for Codex; its model provider appends /codex.
+pub fn codex_url() -> String {
+    format!("http://127.0.0.1:{CODEX_PORT}/backend-api")
+}
 pub fn credential_path(tool: &str) -> Result<PathBuf> {
     if !["claude", "codex"].contains(&tool) {
         bail!("unsupported auth tool");

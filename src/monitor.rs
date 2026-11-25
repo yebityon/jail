@@ -23,7 +23,7 @@ const TIMEOUT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct View {
-    id: String,
+    container: String,
     project: String,
     state: String,
     ports: Vec<project::Port>,
@@ -103,13 +103,13 @@ fn state(
 ) -> Result<String> {
     let Some(entry) = list
         .iter()
-        .find(|entry| container_id(entry) == Some(record.id.as_str()))
+        .find(|entry| container_id(entry) == Some(record.container.as_str()))
     else {
         return Ok("missing".into());
     };
     if !labeled_for(entry, &record.root) {
         let inspection: Value =
-            serde_json::from_slice(&capture(b, &["inspect", &record.id], stop)?)?;
+            serde_json::from_slice(&capture(b, &["inspect", &record.container], stop)?)?;
         if !labeled_for(&inspection, &record.root) {
             bail!("ownership label mismatch; refusing to monitor this container");
         }
@@ -173,7 +173,7 @@ fn sample(
         .iter()
         .map(|record| {
             let mut view = View {
-                id: record.id.clone(),
+                container: record.container.clone(),
                 project: record.root.display().to_string(),
                 ports: record.ports.clone(),
                 ..View::default()
@@ -191,7 +191,7 @@ fn sample(
     let running = views
         .iter()
         .filter(|v| v.state == "running")
-        .map(|v| v.id.as_str())
+        .map(|v| v.container.as_str())
         .collect::<Vec<_>>();
     previous.retain(|id, _| running.contains(&id.as_str()));
     if running.is_empty() {
@@ -205,13 +205,16 @@ fn sample(
     for view in views.iter_mut().filter(|v| v.state == "running") {
         match &stats {
             Ok(stats) => {
-                if let Some(stat) = stats.iter().find(|s| s["id"].as_str() == Some(&view.id)) {
+                if let Some(stat) = stats
+                    .iter()
+                    .find(|s| s["id"].as_str() == Some(&view.container))
+                {
                     view.memory = stat["memoryUsageBytes"].as_u64();
                     view.limit = stat["memoryLimitBytes"].as_u64();
                     view.pids = stat["numProcesses"].as_u64();
                     if let Some(counter) = stat["cpuUsageUsec"].as_u64() {
-                        view.cpu = cpu_usage(previous.get(&view.id), counter, sampled);
-                        previous.insert(view.id.clone(), (counter, sampled));
+                        view.cpu = cpu_usage(previous.get(&view.container), counter, sampled);
+                        previous.insert(view.container.clone(), (counter, sampled));
                     }
                 }
             }
@@ -224,7 +227,7 @@ fn sample(
                 "exec",
                 "--user",
                 "root",
-                &view.id,
+                &view.container,
                 "ps",
                 "-eo",
                 "pid=,ppid=,uid=,etimes=,pcpu=,pmem=,comm=",
@@ -311,7 +314,7 @@ fn lines(
         lines.push(String::new());
         lines.push(format!(
             "{}  [{}]",
-            view.id,
+            view.container,
             view.state.to_ascii_uppercase()
         ));
         lines.push(format!("Project: {}", view.project));
@@ -549,7 +552,7 @@ mod tests {
         );
         assert_eq!(p.len(), 2);
         let view = View {
-            id: "jail-test".into(),
+            container: "jail-test".into(),
             state: "running".into(),
             processes: p,
             memory: Some(1024 * 1024),

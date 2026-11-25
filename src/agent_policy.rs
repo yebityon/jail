@@ -1,4 +1,4 @@
-use crate::config::Config;
+use crate::{config::Config, gateway};
 use anyhow::{bail, Result};
 
 /// Tool restrictions are defense in depth. VM mounts and firewall are the hard boundary.
@@ -123,11 +123,13 @@ pub fn agent_args(tool: &str, args: &[String], c: &Config) -> Result<Vec<String>
                 }
             ),
             "cli_auth_credentials_store=\"file\"".into(),
-            "chatgpt_base_url=\"http://127.0.0.1:3131/backend-api\"".into(),
+            format!("chatgpt_base_url=\"{}\"", gateway::codex_url()),
             "model_provider=\"jail_oauth\"".into(),
             "model_providers.jail_oauth.name=\"Jail subscription gateway\"".into(),
-            "model_providers.jail_oauth.base_url=\"http://127.0.0.1:3131/backend-api/codex\""
-                .into(),
+            format!(
+                "model_providers.jail_oauth.base_url=\"{}/codex\"",
+                gateway::codex_url()
+            ),
             "model_providers.jail_oauth.wire_api=\"responses\"".into(),
             "model_providers.jail_oauth.requires_openai_auth=true".into(),
             "model_providers.jail_oauth.supports_websockets=false".into(),
@@ -177,14 +179,14 @@ pub fn claude_settings(c: &Config) -> serde_json::Value {
         "syncClaudeAiSkills": false,
         "syncClaudeAiPlugins": false,
         "enabledPlugins": {},
-        "env": {"ANTHROPIC_BASE_URL":"http://127.0.0.1:3130"},
+        "env": {"ANTHROPIC_BASE_URL": gateway::claude_url()},
         "autoUpdatesChannel": "stable"
     })
 }
 
 pub fn codex_requirements(c: &Config) -> String {
     // Restrict configured MCP servers even if project config adds them.
-    let mut text = String::from("chatgpt_base_url = \"http://127.0.0.1:3131/backend-api\"\n");
+    let mut text = format!("chatgpt_base_url = \"{}\"\n", gateway::codex_url());
     if !c.tools.edit || c.workspace.read_only {
         text.push_str("allowed_sandbox_modes = [\"read-only\"]\n");
     }

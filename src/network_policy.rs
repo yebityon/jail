@@ -1,17 +1,25 @@
 //! Root-owned live policy and bounded, metadata-only denial journal.
-use crate::config::{Config, Network, NetworkMode};
+use crate::{
+    config::{Config, Network, NetworkMode},
+    PRIVATE,
+};
 use anyhow::{bail, Result};
 use serde::{Deserialize, Serialize};
 use std::{
     fs,
     io::Write,
     os::unix::fs::OpenOptionsExt,
+    path::{Path, PathBuf},
     sync::Mutex,
     time::{SystemTime, UNIX_EPOCH},
 };
 
-pub const LIVE: &str = "/run/jail-private/network.json";
-pub const LOG: &str = "/run/jail-private/denials.jsonl";
+fn live() -> PathBuf {
+    Path::new(PRIVATE).join("network.json")
+}
+fn log() -> PathBuf {
+    Path::new(PRIVATE).join("denials.jsonl")
+}
 static JOURNAL: Mutex<()> = Mutex::new(());
 #[derive(Debug, Serialize, Deserialize)]
 pub struct Denial {
@@ -26,20 +34,22 @@ pub fn store(network: &Network) -> Result<()> {
         ..Config::default()
     };
     cfg.validate()?;
+    let live = live();
+    let new = live.with_extension("json.new");
     let mut f = fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(format!("{LIVE}.new"))?;
+        .open(&new)?;
     f.write_all(&serde_json::to_vec(network)?)?;
     f.sync_all()?;
-    fs::rename(format!("{LIVE}.new"), LIVE)?;
+    fs::rename(new, live)?;
     Ok(())
 }
 pub fn load() -> Result<Network> {
-    let network: Network = serde_json::from_slice(&fs::read(LIVE)?)?;
+    let network: Network = serde_json::from_slice(&fs::read(live())?)?;
     let cfg = Config {
         network: network.clone(),
         ..Config::default()
@@ -74,18 +84,19 @@ pub fn deny(host: &str, port: u16, reason: &str) -> Result<()> {
         port,
         reason: reason.into(),
     };
-    if fs::metadata(LOG)
+    let log = log();
+    if fs::metadata(&log)
         .map(|m| m.len() >= 1024 * 1024)
         .unwrap_or(false)
     {
-        fs::rename(LOG, format!("{LOG}.previous"))?;
+        fs::rename(&log, log.with_extension("jsonl.previous"))?;
     }
     let mut file = fs::OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
-        .open(LOG)?;
+        .open(&log)?;
     serde_json::to_writer(&mut file, &entry)?;
     file.write_all(b"\n")?;
     Ok(())
@@ -95,7 +106,8 @@ pub fn journal() -> Result<Vec<Denial>> {
         .lock()
         .map_err(|_| anyhow::anyhow!("journal lock failed"))?;
     let mut out = vec![];
-    for path in [format!("{LOG}.previous"), LOG.into()] {
+    let log = log();
+    for path in [log.with_extension("jsonl.previous"), log] {
         match fs::read_to_string(path) {
             Ok(s) => {
                 for line in s.lines() {

@@ -11,7 +11,7 @@ mod write_guard;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use fs2::FileExt;
-use jail::{config::Config, digest, policy};
+use jail::{agent_policy, config::Config, digest, GUEST};
 use std::{
     ffi::OsString,
     fs,
@@ -113,6 +113,15 @@ enum ConfigAction {
     Init,
     Show,
 }
+/// How the host process runs a launched agent or shell.
+enum Session {
+    /// Replace jail with the container client.
+    Exec,
+    /// Relay the terminal through a PTY so jail answers a typed /login.
+    Pty,
+    /// Wait and forward signals, for host login sync and auto-stop.
+    Wait,
+}
 
 fn user_home() -> Result<PathBuf> {
     std::env::var_os("HOME")
@@ -210,7 +219,8 @@ fn run(mut cli: Cli) -> Result<i32> {
         return policy_cli::run(action, &path, &cfg, &backend, &data, &project);
     }
     let mut launch = None;
-    let mut import_login = true;
+    // --help and --version run without a login.
+    let mut needs_login = true;
     match &action {
         Action::Tool(raw) => {
             let tool = raw
@@ -225,10 +235,13 @@ fn run(mut cli: Cli) -> Result<i32> {
                         .context("arguments must be UTF-8")
                 })
                 .collect::<Result<Vec<_>>>()?;
-            import_login = !args
+            needs_login = !args
                 .iter()
                 .any(|a| ["--help", "-h", "--version", "-V"].contains(&a.as_str()));
-            launch = Some((tool.to_owned(), policy::agent_args(tool, &args, &cfg)?));
+            launch = Some((
+                tool.to_owned(),
+                agent_policy::agent_args(tool, &args, &cfg)?,
+            ));
         }
         Action::Shell => {
             if !cfg.tools.shell {
@@ -267,8 +280,8 @@ fn run(mut cli: Cli) -> Result<i32> {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
-                "container": project.record(&data)?.map(|r| r.id).unwrap_or(project.new_container_name()?),
-                "project_key": project.id, "home_volume": format!("{}-home", project.id),
+                "container": project.record(&data)?.map(|r| r.container).unwrap_or(project.new_container_name()?),
+                "project_key": project.key, "home_volume": project::home_volume(&project.key),
                 "container_name_note": "new names include local creation time; dry-run name is a preview",
                 "image": image, "workspace": project.root,
                 "cwd": project.cwd, "read_only": cfg.workspace.read_only || !cfg.tools.edit,
@@ -295,7 +308,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                 "exec",
                 "--user",
                 "root",
-                &record.id,
+                &record.container,
                 "ps",
                 "-eo",
                 "pid,ppid,user,pcpu,pmem,etime,args",
@@ -308,36 +321,36 @@ fn run(mut cli: Cli) -> Result<i32> {
                 project.record(&data)?.into_iter().collect()
             };
             for record in records {
-                let key = project::project_id(&record.root);
-                let mutation = project::lock(&data, &key, "lifecycle")?;
-                FileExt::lock_exclusive(&mutation)?;
+                let key = project::key(&record.root);
+                let lifecycle = project::lock(&data, &key, "lifecycle")?;
+                FileExt::lock_exclusive(&lifecycle)?;
                 let sessions = project::lock(&data, &key, "sessions")?;
                 if !force && FileExt::try_lock_exclusive(&sessions).is_err() {
                     bail!(
                         "{} has active sessions; use --force to stop them",
-                        record.id
+                        record.container
                     );
                 }
                 backend.require_owned(&record)?;
-                backend.checked(&["stop", &record.id])?;
-                println!("stopped {}", record.id);
+                backend.checked(&["stop", &record.container])?;
+                println!("stopped {}", record.container);
             }
             return Ok(0);
         }
         Action::Recreate => {
-            let mutation = project::lock(&data, &project.id, "lifecycle")?;
-            FileExt::lock_exclusive(&mutation)?;
-            let sessions = project::lock(&data, &project.id, "sessions")?;
+            let lifecycle = project::lock(&data, &project.key, "lifecycle")?;
+            FileExt::lock_exclusive(&lifecycle)?;
+            let sessions = project::lock(&data, &project.key, "sessions")?;
             FileExt::try_lock_exclusive(&sessions)
                 .context("active sessions; close them before recreating")?;
             if let Some(record) = project.record(&data)? {
                 backend.require_owned(&record)?;
-                backend.checked(&["stop", &record.id])?;
-                backend.checked(&["delete", &record.id])?;
+                backend.checked(&["stop", &record.container])?;
+                backend.checked(&["delete", &record.container])?;
                 fs::remove_file(project.record_path(&data))?;
                 println!(
                     "removed {} root filesystem; home volume {} is preserved",
-                    record.id, record.volume
+                    record.container, record.volume
                 );
             }
             return Ok(0);
@@ -353,14 +366,14 @@ fn run(mut cli: Cli) -> Result<i32> {
         _ => {}
     }
     backend.ensure_service()?;
-    let mutation = project::lock(&data, &project.id, "lifecycle")?;
-    FileExt::lock_exclusive(&mutation)?;
-    let sessions = project::lock(&data, &project.id, "sessions")?;
+    let lifecycle = project::lock(&data, &project.key, "lifecycle")?;
+    FileExt::lock_exclusive(&lifecycle)?;
+    let sessions = project::lock(&data, &project.key, "sessions")?;
     FileExt::lock_shared(&sessions)?;
     let record = runtime::ensure(&backend, &data, &project, &cfg, &spec)?;
     policy_cli::sync(&backend, &record, &cfg)?;
     if !record.ports.is_empty() {
-        eprintln!("jail: {}", record.id);
+        eprintln!("jail: {}", record.container);
         for port in &record.ports {
             eprintln!("jail: {}", port.description());
         }
@@ -372,11 +385,11 @@ fn run(mut cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let (tool, agent_args) = launch.context("unsupported command")?;
-    let sync_login = tool != "shell" && cfg.auth.import_host && import_login;
-    if sync_login {
+    let host_login = tool != "shell" && cfg.auth.import_host && needs_login;
+    if host_login {
         auth::import(&backend, &record, &data, &tool, false)?;
     }
-    drop(mutation);
+    drop(lifecycle);
     let mut args = vec!["exec".to_owned(), "--interactive".into()];
     for key in &cfg.environment.pass {
         args.extend(["--env".into(), key.clone()]);
@@ -392,17 +405,23 @@ fn run(mut cli: Cli) -> Result<i32> {
         "root".into(),
         "--workdir".into(),
         project.cwd.to_string_lossy().into_owned(),
-        record.id.clone(),
-        "/usr/local/bin/jail-guest".into(),
+        record.container.clone(),
+        GUEST.into(),
         "launch".into(),
         tool.clone(),
     ]);
     args.extend(agent_args);
     let mut command = backend.command(&args);
     let auto_stop = cli.auto_stop || cfg.lifecycle.auto_stop;
-    let interactive_login =
-        tool != "shell" && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    if !auto_stop && !interactive_login && !sync_login {
+    let session =
+        if tool != "shell" && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+            Session::Pty
+        } else if auto_stop || host_login {
+            Session::Wait
+        } else {
+            Session::Exec
+        };
+    if let Session::Exec = session {
         // The container client owns the terminal. Retain the shared session lock
         // across exec so stop/recreate cannot race an active client.
         let fd = sessions.as_raw_fd();
@@ -415,9 +434,9 @@ fn run(mut cli: Cli) -> Result<i32> {
         return Err(command.exec().into());
     }
     // The host process stays alive for the session so host refreshes reach it.
-    let watch = sync_login.then(|| auth::watch(&record, &data, &tool));
-    let result = if interactive_login {
-        terminal::run(&mut command, || auth::refuse_login(&tool, sync_login))
+    let watch = host_login.then(|| auth::watch(&record, &data, &tool));
+    let result = if let Session::Pty = session {
+        terminal::run(&mut command, || auth::refuse_login(&tool, host_login))
     } else {
         wait_with_signals(&mut command)
     };
@@ -428,11 +447,11 @@ fn run(mut cli: Cli) -> Result<i32> {
         return result;
     }
     drop(sessions);
-    let mutation = project::lock(&data, &project.id, "lifecycle")?;
-    FileExt::lock_exclusive(&mutation)?;
-    let sessions = project::lock(&data, &project.id, "sessions")?;
+    let lifecycle = project::lock(&data, &project.key, "lifecycle")?;
+    FileExt::lock_exclusive(&lifecycle)?;
+    let sessions = project::lock(&data, &project.key, "sessions")?;
     if FileExt::try_lock_exclusive(&sessions).is_ok() {
-        if let Err(e) = backend.checked(&["stop", &record.id]) {
+        if let Err(e) = backend.checked(&["stop", &record.container]) {
             eprintln!("jail: auto-stop failed: {e:#}");
         }
     } else {
@@ -500,9 +519,9 @@ fn status(
     for record in records {
         let state = b.owned_state(&record)?;
         if state.as_deref() == Some("running") {
-            running.push(record.id.clone());
+            running.push(record.container.clone());
         }
-        rows.push(serde_json::json!({ "id": record.id, "project": record.root, "state": state.unwrap_or("missing".into()), "ports": record.ports }));
+        rows.push(serde_json::json!({ "id": record.container, "project": record.root, "state": state.unwrap_or("missing".into()), "ports": record.ports }));
     }
     if json {
         let stats = if running.is_empty() {
@@ -544,7 +563,7 @@ fn status(
                 args.push("--no-stream".into());
             }
             args.extend(running);
-            return b.interactive_owned(&args);
+            return b.interactive(&args);
         }
     }
     // watch delegates to Apple's live CPU/memory display without polling a service.

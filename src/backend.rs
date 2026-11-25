@@ -66,10 +66,7 @@ impl Backend {
         self.capture(args)?;
         Ok(())
     }
-    pub fn interactive(&self, args: &[&str]) -> Result<i32> {
-        self.interactive_owned(args)
-    }
-    pub fn interactive_owned<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Result<i32> {
+    pub fn interactive<S: AsRef<std::ffi::OsStr>>(&self, args: &[S]) -> Result<i32> {
         Ok(exit_code(
             self.command(args)
                 .status()
@@ -101,17 +98,17 @@ impl Backend {
     }
     pub fn owned_state(&self, record: &Record) -> Result<Option<String>> {
         for entry in self.list()? {
-            if container_id(&entry) != Some(&record.id) {
+            if container_id(&entry) != Some(&record.container) {
                 continue;
             }
             if !labeled_for(&entry, &record.root) {
                 // Some list versions omit labels, so inspect the exact container.
                 let inspected: Value =
-                    serde_json::from_slice(&self.capture(&["inspect", &record.id])?)?;
+                    serde_json::from_slice(&self.capture(&["inspect", &record.container])?)?;
                 if !labeled_for(&inspected, &record.root) {
                     bail!(
                         "refusing to use container {}: ownership label mismatch",
-                        record.id
+                        record.container
                     );
                 }
             }
@@ -123,7 +120,7 @@ impl Backend {
     }
     pub fn require_owned(&self, record: &Record) -> Result<()> {
         if self.owned_state(record)?.is_none() {
-            bail!("container {} does not exist", record.id);
+            bail!("container {} does not exist", record.container);
         }
         Ok(())
     }

@@ -5,7 +5,7 @@ use crate::{
 };
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
-use jail::digest;
+use jail::{digest, GUEST};
 use serde_json::Value;
 use std::{
     fs,
@@ -82,7 +82,7 @@ fn host_credentials(tool: &str) -> Result<Option<Vec<u8>>> {
 /// Change marker for the host login, never the secret itself: file metadata,
 /// or Keychain attributes including `mdat`. Reading attributes does not ask
 /// for Keychain access, so polling cannot trigger repeated prompts.
-fn version(tool: &str) -> Result<String> {
+fn fingerprint(tool: &str) -> Result<String> {
     let source = source(tool)?;
     if source.file.is_file() {
         use std::os::unix::fs::MetadataExt;
@@ -112,14 +112,13 @@ fn version(tool: &str) -> Result<String> {
     }
     Ok("none".into())
 }
-fn version_path(data: &Path, record: &Record, tool: &str) -> PathBuf {
-    data.join("projects")
-        .join(project::project_id(&record.root))
-        .join(format!("auth-{tool}.version"))
+fn fingerprint_path(data: &Path, record: &Record, tool: &str) -> PathBuf {
+    // The file keeps its earlier name, so upgrading does not resend the login.
+    project::dir(data, &project::key(&record.root)).join(format!("auth-{tool}.version"))
 }
-fn save_version(data: &Path, record: &Record, tool: &str, version: &str) -> Result<()> {
-    let path = version_path(data, record, tool);
-    project::private_dir(path.parent().context("version has no parent")?)?;
+fn save_fingerprint(data: &Path, record: &Record, tool: &str, fingerprint: &str) -> Result<()> {
+    let path = fingerprint_path(data, record, tool);
+    project::private_dir(path.parent().context("fingerprint has no parent")?)?;
     use std::os::unix::fs::OpenOptionsExt;
     fs::OpenOptions::new()
         .create(true)
@@ -128,7 +127,7 @@ fn save_version(data: &Path, record: &Record, tool: &str, version: &str) -> Resu
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(path)?
-        .write_all(version.as_bytes())?;
+        .write_all(fingerprint.as_bytes())?;
     Ok(())
 }
 fn sanitize(tool: &str, bytes: &[u8]) -> Result<Vec<u8>> {
@@ -156,24 +155,28 @@ fn sanitize(tool: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     jail::gateway::token(tool, &Value::Object(out.clone()))?;
     Ok(serde_json::to_vec(&out)?)
 }
+/// Loads the host login into the container's gateway. `explicit` is set by
+/// `jail auth`: it replaces a login the container already has and fails when
+/// the host has none. A launch keeps an existing login, and on a terminal it
+/// only warns about a missing one.
 pub fn import(
     backend: &Backend,
     record: &Record,
     data: &Path,
     tool: &str,
-    force: bool,
+    explicit: bool,
 ) -> Result<()> {
     if !["claude", "codex"].contains(&tool) {
         bail!("auth tool must be claude or codex");
     }
-    if !force {
+    if !explicit {
         let output = backend
             .command(&[
                 "exec",
                 "--user",
                 "root",
-                &record.id,
-                "/usr/local/bin/jail-guest",
+                &record.container,
+                GUEST,
                 "has-auth",
                 tool,
             ])
@@ -189,10 +192,10 @@ pub fn import(
         }
     }
     // Capture the marker first; a host refresh during the read is synced later.
-    let version = version(tool)?;
+    let fingerprint = fingerprint(tool)?;
     let credentials = host_credentials(tool)?;
     let Some(bytes) = credentials else {
-        if !force && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        if !explicit && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
             eprintln!(
                 "jail: no host login found; run `{}` on the Mac and this session receives it within about 15 seconds",
                 host_login_command(tool)
@@ -205,7 +208,7 @@ pub fn import(
         );
     };
     send(backend, record, tool, &bytes, "import-auth")?;
-    save_version(data, record, tool, &version)
+    save_fingerprint(data, record, tool, &fingerprint)
 }
 
 const SYNC_INTERVAL: Duration = Duration::from_secs(15);
@@ -243,7 +246,7 @@ pub fn watch(record: &Record, data: &Path, tool: &str) -> Watch {
     let tool = tool.to_owned();
     let thread = std::thread::spawn(move || {
         let backend = Backend::new();
-        let key = project::project_id(&record.root);
+        let key = project::key(&record.root);
         let mut owner = None;
         let mut failure = None;
         loop {
@@ -277,14 +280,14 @@ pub fn watch(record: &Record, data: &Path, tool: &str) -> Watch {
 }
 /// Returns whether the host login changed and a sync was attempted.
 fn follow(backend: &Backend, record: &Record, data: &Path, tool: &str) -> Result<bool> {
-    let version = version(tool)?;
-    if fs::read_to_string(version_path(data, record, tool)).ok() == Some(version.clone()) {
+    let fingerprint = fingerprint(tool)?;
+    if fs::read_to_string(fingerprint_path(data, record, tool)).ok() == Some(fingerprint.clone()) {
         return Ok(false);
     }
     let credentials = host_credentials(tool);
     // Record the attempt even on failure: a denied Keychain read must not
     // prompt again every interval. A partly written file changes the marker.
-    save_version(data, record, tool, &version)?;
+    save_fingerprint(data, record, tool, &fingerprint)?;
     if let Some(bytes) = credentials? {
         pipe(backend, record, tool, &bytes, "sync-auth")?;
     }
@@ -319,8 +322,8 @@ fn pipe(
             "--interactive",
             "--user",
             "root",
-            &record.id,
-            "/usr/local/bin/jail-guest",
+            &record.container,
+            GUEST,
             operation,
             tool,
         ])
