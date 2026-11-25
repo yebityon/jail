@@ -1,5 +1,5 @@
 use crate::{
-    backend::Backend,
+    backend::{container_id, Backend},
     project::{self, Port, Project, Record},
 };
 use anyhow::{bail, Context, Result};
@@ -139,12 +139,7 @@ pub fn ensure(
         project.new_container_name()?
     };
     // Do not claim an existing container name whose state was lost.
-    if backend.list()?.iter().any(|v| {
-        v.get("id")
-            .or_else(|| v.pointer("/configuration/id"))
-            .and_then(serde_json::Value::as_str)
-            == Some(&id)
-    }) {
+    if backend.list()?.iter().any(|v| container_id(v) == Some(&id)) {
         bail!(
             "container name {} is already in use without matching jail state",
             id

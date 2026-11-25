@@ -1,5 +1,8 @@
 //! Read-only host-side dashboard. Never launches agents or holds session leases.
-use crate::{backend::Backend, project};
+use crate::{
+    backend::{container_id, container_state, labeled_for, Backend},
+    project,
+};
 use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
@@ -98,40 +101,20 @@ fn state(
     list: &[Value],
     stop: &AtomicBool,
 ) -> Result<String> {
-    let Some(entry) = list.iter().find(|entry| {
-        entry
-            .get("id")
-            .or_else(|| entry.pointer("/configuration/id"))
-            .and_then(Value::as_str)
-            == Some(record.id.as_str())
-    }) else {
+    let Some(entry) = list
+        .iter()
+        .find(|entry| container_id(entry) == Some(record.id.as_str()))
+    else {
         return Ok("missing".into());
     };
-    let expected = record.root.to_string_lossy();
-    let label = entry
-        .pointer("/configuration/labels/io.jail.project")
-        .or_else(|| entry.pointer("/labels/io.jail.project"));
-    if label.and_then(Value::as_str) != Some(expected.as_ref()) {
+    if !labeled_for(entry, &record.root) {
         let inspection: Value =
             serde_json::from_slice(&capture(b, &["inspect", &record.id], stop)?)?;
-        let inspection = inspection
-            .as_array()
-            .and_then(|a| a.first())
-            .unwrap_or(&inspection);
-        let label = inspection
-            .pointer("/configuration/labels/io.jail.project")
-            .or_else(|| inspection.pointer("/labels/io.jail.project"));
-        if label.and_then(Value::as_str) != Some(expected.as_ref()) {
+        if !labeled_for(&inspection, &record.root) {
             bail!("ownership label mismatch; refusing to monitor this container");
         }
     }
-    entry
-        .pointer("/status/state")
-        .or_else(|| entry.get("status"))
-        .or_else(|| entry.get("state"))
-        .and_then(Value::as_str)
-        .map(str::to_ascii_lowercase)
-        .context("container state is missing")
+    container_state(entry).context("container state is missing")
 }
 
 fn processes(bytes: &[u8]) -> Vec<Process> {

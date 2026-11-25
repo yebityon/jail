@@ -2,7 +2,7 @@
 //! own formats are touched, one by one; resources still used by any container
 //! are refused, or skipped by --all-delete.
 use crate::{
-    backend::Backend,
+    backend::{container_id, Backend},
     project::{self, Project, Record},
 };
 use anyhow::{bail, Context, Result};
@@ -47,12 +47,6 @@ fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
         Value::Object(map) => map.values().for_each(|v| strings(v, out)),
         _ => {}
     }
-}
-fn container_id(entry: &Value) -> Option<&str> {
-    entry
-        .get("id")
-        .or_else(|| entry.pointer("/configuration/id"))
-        .and_then(Value::as_str)
 }
 /// Containers that may use `name`. The container JSON layout differs between
 /// backend versions, so any mention counts; jail state covers its own records.
