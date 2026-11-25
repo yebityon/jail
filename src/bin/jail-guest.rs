@@ -1,13 +1,14 @@
 //! Trusted Linux-side supervisor. The user-facing CLI is the `jail` binary.
 use anyhow::{bail, Context, Result};
 use jail::{
+    agent_policy,
     config::{Config, Network, NetworkMode},
-    gateway, network_policy, policy, proxy,
+    gateway, network_policy, proxy, GUEST, READY,
 };
 use std::{
     fs,
     io::{Read, Write},
-    net::TcpListener,
+    net::{Ipv4Addr, TcpListener},
     os::unix::{
         fs::{OpenOptionsExt, PermissionsExt},
         process::CommandExt,
@@ -15,6 +16,9 @@ use std::{
     path::{Path, PathBuf},
     process::{Command, Stdio},
 };
+
+/// Trusted configuration as validated at container start.
+const CONFIG: &str = "/etc/jail/config.json";
 
 fn main() {
     match run() {
@@ -61,7 +65,7 @@ fn identity() -> Result<(u32, u32)> {
     Ok((uid, gid))
 }
 fn config() -> Result<Config> {
-    Ok(serde_json::from_slice(&fs::read("/etc/jail/policy.json")?)?)
+    Ok(serde_json::from_slice(&fs::read(CONFIG)?)?)
 }
 fn secure_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     let mut file = fs::OpenOptions::new()
@@ -86,18 +90,14 @@ fn init() -> Result<()> {
     if unsafe { libc::geteuid() } != 0 {
         bail!("supervisor must start as root");
     }
-    let c: Config = serde_json::from_str(&std::env::var("JAIL_POLICY")?)?;
+    let c: Config = serde_json::from_str(&std::env::var("JAIL_CONFIG_JSON")?)?;
     c.validate()?;
     protect_paths()?;
     gateway::prepare()?;
     network_policy::store(&c.network)?;
     let (uid, gid) = identity()?;
     fs::create_dir_all("/etc/jail")?;
-    secure_write(
-        Path::new("/etc/jail/policy.json"),
-        &serde_json::to_vec(&c)?,
-        0o600,
-    )?;
+    secure_write(Path::new(CONFIG), &serde_json::to_vec(&c)?, 0o600)?;
     for dir in ["/home/jail", "/home/jail/.claude", "/home/jail/.codex"] {
         if let Ok(metadata) = fs::symlink_metadata(dir) {
             if metadata.file_type().is_symlink() || !metadata.is_dir() {
@@ -108,7 +108,7 @@ fn init() -> Result<()> {
         chown(Path::new(dir), uid, gid)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
-    let claude = serde_json::to_vec(&policy::claude_settings(&c))?;
+    let claude = serde_json::to_vec(&agent_policy::claude_settings(&c))?;
     secure_write(Path::new("/etc/jail/claude-settings.json"), &claude, 0o644)?;
     secure_write(
         Path::new("/etc/claude-code/managed-settings.json"),
@@ -117,7 +117,7 @@ fn init() -> Result<()> {
     )?;
     secure_write(
         Path::new("/etc/codex/requirements.toml"),
-        policy::codex_requirements(&c).as_bytes(),
+        agent_policy::codex_requirements(&c).as_bytes(),
         0o644,
     )?;
     // The CLI handles onboarding without copying ~/.claude.json host settings.
@@ -128,16 +128,14 @@ fn init() -> Result<()> {
     }
     // Migrate known legacy credential files as the agent, never root-write into
     // agent-owned home paths. Real credentials live only in root-owned tmpfs.
-    let status = Command::new("/usr/local/bin/jail-guest")
-        .arg("prepare-auth")
-        .status()?;
+    let status = Command::new(GUEST).arg("prepare-auth").status()?;
     if !status.success() {
         bail!("could not prepare credential placeholders");
     }
-    let claude_listener = TcpListener::bind("127.0.0.1:3130")?;
-    let codex_listener = TcpListener::bind("127.0.0.1:3131")?;
+    let claude_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, gateway::CLAUDE_PORT))?;
+    let codex_listener = TcpListener::bind((Ipv4Addr::LOCALHOST, gateway::CODEX_PORT))?;
     let listener = if c.network.mode == NetworkMode::Allowlist {
-        Some(TcpListener::bind("127.0.0.1:3128")?)
+        Some(TcpListener::bind((Ipv4Addr::LOCALHOST, proxy::PORT))?)
     } else {
         None
     };
@@ -155,7 +153,7 @@ fn init() -> Result<()> {
         }
     });
     // Readiness is emitted only after both IPv4 and IPv6 policy succeeds.
-    secure_write(Path::new("/run/jail-ready"), b"ready\n", 0o644)?;
+    secure_write(Path::new(READY), b"ready\n", 0o644)?;
     if let Some(listener) = listener {
         return proxy::serve(listener, c.network);
     }
@@ -271,7 +269,7 @@ fn firewall(uid: u32, network: &Network) -> Result<()> {
             ],
         )?;
         if binary == "iptables" && network.mode == NetworkMode::Allowlist {
-            for port in ["3128", "3130", "3131"] {
+            for port in [proxy::PORT, gateway::CLAUDE_PORT, gateway::CODEX_PORT] {
                 checked(
                     binary,
                     &[
@@ -284,7 +282,7 @@ fn firewall(uid: u32, network: &Network) -> Result<()> {
                         "-d",
                         "127.0.0.1",
                         "--dport",
-                        port,
+                        &port.to_string(),
                         "-j",
                         "ACCEPT",
                     ],
@@ -399,7 +397,7 @@ fn prepare_auth() -> Result<()> {
     Ok(())
 }
 fn launch(tool: &str, args: Vec<String>) -> Result<()> {
-    if !Path::new("/run/jail-ready").is_file() {
+    if !Path::new(READY).is_file() {
         bail!("container policy is not ready");
     }
     let c = config()?;
@@ -426,7 +424,7 @@ fn launch(tool: &str, args: Vec<String>) -> Result<()> {
         // Keep Claude's default layout: setting CLAUDE_CONFIG_DIR also moves
         // its global .claude.json inside that directory, breaking onboarding.
         .env("DISABLE_AUTOUPDATER", "1");
-    command.env("ANTHROPIC_BASE_URL", "http://127.0.0.1:3130");
+    command.env("ANTHROPIC_BASE_URL", gateway::claude_url());
     for (key, value) in &c.environment.set {
         command.env(key, value);
     }
@@ -444,7 +442,7 @@ fn launch(tool: &str, args: Vec<String>) -> Result<()> {
             "ALL_PROXY",
             "all_proxy",
         ] {
-            command.env(key, "http://127.0.0.1:3128");
+            command.env(key, proxy::url());
         }
         command
             .env("NO_PROXY", "127.0.0.1")

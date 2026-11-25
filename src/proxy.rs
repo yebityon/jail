@@ -13,6 +13,13 @@ use std::{
     time::Duration,
 };
 
+/// Loopback port of the proxy inside the container.
+pub const PORT: u16 = 3128;
+/// Proxy URL for the agent's HTTP(S)_PROXY variables.
+pub fn url() -> String {
+    format!("http://127.0.0.1:{PORT}")
+}
+
 pub fn host_allowed(host: &str, rules: &[String]) -> bool {
     let host = host.to_ascii_lowercase();
     if host.is_empty()

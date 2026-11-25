@@ -1,5 +1,8 @@
+//! jail's data directory: each project's record and locks in
+//! `projects/<key>/`, locks shared by all projects in `locks/`, and image
+//! build contexts in `build/`.
 use anyhow::{bail, Context, Result};
-use jail::{config::validate_mount_path, digest};
+use jail::{config::validate_mount_path, digest, is_digest};
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -13,11 +16,14 @@ use std::{
 pub struct Project {
     pub root: PathBuf,
     pub cwd: PathBuf,
-    pub id: String,
+    pub key: String,
 }
+/// jail's record of a project's container, saved as `record.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Record {
-    pub id: String,
+    /// Container name, which the backend reports as the container ID.
+    #[serde(rename = "id")]
+    pub container: String,
     pub root: PathBuf,
     pub spec: String,
     pub image: String,
@@ -41,11 +47,23 @@ impl Port {
         )
     }
 }
-pub fn project_id(root: &Path) -> String {
+/// Hex digits of a project key.
+const KEY_DIGITS: usize = 16;
+/// Stable key of the project at `root`. It names the project's locks, record
+/// and home volume, never the container.
+pub fn key(root: &Path) -> String {
     format!(
         "jail-{}",
-        &digest(root.as_os_str().as_encoded_bytes())[..16]
+        &digest(root.as_os_str().as_encoded_bytes())[..KEY_DIGITS]
     )
+}
+pub fn home_volume(key: &str) -> String {
+    format!("{key}-home")
+}
+/// Project key of a home volume name, if the name has jail's format.
+pub fn volume_key(name: &str) -> Option<&str> {
+    let key = name.strip_suffix("-home")?;
+    is_digest(key.strip_prefix("jail-")?, KEY_DIGITS).then_some(key)
 }
 fn directory_slug(root: &Path) -> String {
     let directory = root.file_name().unwrap_or_default().to_string_lossy();
@@ -84,10 +102,10 @@ impl Project {
             bail!("working directory is outside the Git root");
         }
         validate_mount_path(&root)?;
-        // Stable identity is only for locks, metadata and the persistent home.
-        // The visible container name is independent and stored in Record.id.
-        let id = project_id(&root);
-        Ok(Self { root, cwd, id })
+        // The visible container name is independent of the key and stored in
+        // Record.container.
+        let key = key(&root);
+        Ok(Self { root, cwd, key })
     }
     pub fn new_container_name(&self) -> Result<String> {
         let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
@@ -109,7 +127,7 @@ impl Project {
         ))
     }
     pub fn record_path(&self, data: &Path) -> PathBuf {
-        data.join("projects").join(&self.id).join("record.json")
+        dir(data, &self.key).join("record.json")
     }
     pub fn record(&self, data: &Path) -> Result<Option<Record>> {
         read_record(&self.record_path(data))
@@ -135,7 +153,7 @@ impl Project {
 fn read_record(path: &Path) -> Result<Option<Record>> {
     match fs::read(path) {
         Ok(bytes) => Ok(Some(
-            serde_json::from_slice(&bytes).context("invalid jail state")?,
+            serde_json::from_slice(&bytes).context("invalid jail record")?,
         )),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
         Err(e) => Err(e.into()),
@@ -149,9 +167,37 @@ pub fn private_dir(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
-pub fn lock(data: &Path, id: &str, name: &str) -> Result<File> {
-    let dir = data.join("projects").join(id);
-    private_dir(&dir)?;
+fn projects(data: &Path) -> PathBuf {
+    data.join("projects")
+}
+/// Directory of one project's record, locks and login fingerprints.
+pub fn dir(data: &Path, key: &str) -> PathBuf {
+    projects(data).join(key)
+}
+/// Opens one project's lock file; callers lock it shared or exclusively.
+/// - `lifecycle`: held exclusively while launch, stop, recreate, a policy
+///   change or home volume deletion changes that project's container.
+/// - `sessions`: each running session holds it shared; stop, recreate and
+///   auto-stop take it exclusively to prove that no session is active.
+/// - `auth-<tool>`: held by the one session that follows host login
+///   refreshes; others only try it, never wait.
+///
+/// Take lifecycle before sessions, and both before any global lock.
+pub fn lock(data: &Path, key: &str, name: &str) -> Result<File> {
+    open_lock(&dir(data, key), name)
+}
+/// Opens a lock file shared by all projects.
+/// - `image-build`: held while an image is built or deleted.
+/// - `port-allocation`: held while host ports are chosen and a container is
+///   created or restarted. Image deletion holds it too, so creation can
+///   re-check that its image still exists.
+///
+/// Take image-build before port-allocation.
+pub fn global_lock(data: &Path, name: &str) -> Result<File> {
+    open_lock(&data.join("locks"), name)
+}
+fn open_lock(dir: &Path, name: &str) -> Result<File> {
+    private_dir(dir)?;
     Ok(OpenOptions::new()
         .create(true)
         .truncate(false)
@@ -162,7 +208,7 @@ pub fn lock(data: &Path, id: &str, name: &str) -> Result<File> {
         .open(dir.join(format!("{name}.lock")))?)
 }
 pub fn records(data: &Path) -> Result<Vec<Record>> {
-    let dir = data.join("projects");
+    let dir = projects(data);
     if !dir.exists() {
         return Ok(vec![]);
     }
@@ -172,7 +218,7 @@ pub fn records(data: &Path) -> Result<Vec<Record>> {
             out.push(record);
         }
     }
-    out.sort_by(|a, b| a.id.cmp(&b.id));
+    out.sort_by(|a, b| a.container.cmp(&b.container));
     Ok(out)
 }
 
@@ -185,7 +231,7 @@ mod tests {
         assert_eq!(directory_slug(&root), "my-project-01");
         assert_eq!(directory_slug(Path::new("/tmp/日本語")), "project");
         let project = Project {
-            id: project_id(&root),
+            key: key(&root),
             cwd: root.clone(),
             root,
         };
@@ -193,8 +239,8 @@ mod tests {
         assert!(name.starts_with("jail-my-project-01-"));
         assert!(name.len() <= 63);
         assert!(name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-'));
-        assert_eq!(project.id, project_id(&project.root));
-        assert_ne!(project.id, name);
+        assert_eq!(project.key, key(&project.root));
+        assert_ne!(project.key, name);
     }
     #[test]
     fn legacy_records_without_ports_are_readable() {

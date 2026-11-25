@@ -6,12 +6,12 @@ use anyhow::{bail, Context, Result};
 use fs2::FileExt;
 use jail::{
     config::{Config, NetworkMode},
-    digest,
+    digest, is_digest, READY,
 };
 use std::{
     fs,
     net::{Ipv4Addr, TcpListener},
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -21,13 +21,16 @@ const FILES: &[(&str, &str)] = &[
     ("src/main.rs", "fn main() {}\n"),
     ("src/lib.rs", include_str!("lib.rs")),
     ("src/config.rs", include_str!("config.rs")),
-    ("src/policy.rs", include_str!("policy.rs")),
+    ("src/agent_policy.rs", include_str!("agent_policy.rs")),
     ("src/proxy.rs", include_str!("proxy.rs")),
     ("src/network_policy.rs", include_str!("network_policy.rs")),
     ("src/gateway.rs", include_str!("gateway.rs")),
     ("src/bin/jail-guest.rs", include_str!("bin/jail-guest.rs")),
     ("Dockerfile", include_str!("../container/Dockerfile")),
 ];
+const IMAGE_PREFIX: &str = "jail-runtime:";
+/// Hex digits of an image tag.
+const TAG_DIGITS: usize = 20;
 pub fn revision() -> String {
     digest(include_bytes!("runtime.rs"))
 }
@@ -43,12 +46,23 @@ pub fn image_tag(cfg: &Config) -> String {
         material.push_str(path);
         material.push_str(content);
     }
-    format!("jail-runtime:{}", &digest(material)[..20])
+    format!("{IMAGE_PREFIX}{}", &digest(material)[..TAG_DIGITS])
+}
+/// The tag without a registry prefix, if `name` is an image in jail's format.
+pub fn image_name(name: &str) -> Option<&str> {
+    let name = name.strip_prefix("docker.io/library/").unwrap_or(name);
+    name.strip_prefix(IMAGE_PREFIX)
+        .is_some_and(|h| is_digest(h, TAG_DIGITS))
+        .then_some(name)
+}
+/// Source and version pins for building `image`, never a workspace or credentials.
+pub fn build_context(data: &Path, image: &str) -> PathBuf {
+    data.join("build").join(image.replace(':', "-"))
 }
 pub fn build(backend: &Backend, data: &Path, cfg: &Config, force: bool) -> Result<String> {
     let image = image_tag(cfg);
-    let lock = project::lock(data, "image", "build")?;
-    FileExt::lock_exclusive(&lock)?;
+    let image_build = project::global_lock(data, "image-build")?;
+    FileExt::lock_exclusive(&image_build)?;
     if !force
         && backend
             .command(&["image", "inspect", &image])
@@ -58,7 +72,7 @@ pub fn build(backend: &Backend, data: &Path, cfg: &Config, force: bool) -> Resul
     {
         return Ok(image);
     }
-    let context = data.join("build").join(image.replace(':', "-"));
+    let context = build_context(data, &image);
     project::private_dir(&context)?;
     for (path, content) in FILES {
         let destination = context.join(path);
@@ -85,7 +99,7 @@ pub fn build(backend: &Backend, data: &Path, cfg: &Config, force: bool) -> Resul
         args.extend(["--no-cache".into(), "--pull".into()]);
     }
     args.push(context.to_string_lossy().into_owned());
-    if backend.interactive_owned(&args)? != 0 {
+    if backend.interactive(&args)? != 0 {
         bail!("image build failed");
     }
     Ok(image)
@@ -97,22 +111,22 @@ pub fn ensure(
     cfg: &Config,
     spec: &str,
 ) -> Result<Record> {
-    let volume = format!("{}-home", project.id);
+    let volume = project::home_volume(&project.key);
     let image = image_tag(cfg);
     let existing = project.record(data)?;
     if let Some(record) = &existing {
         if record.root != project.root || record.volume != volume {
-            bail!("project state does not match this workspace");
+            bail!("jail record does not match this workspace");
         }
         if record.spec != spec {
             bail!("configuration or image changed; close sessions, then run jail recreate (home/history persist, host login is re-imported; installed OS packages will be removed)");
         }
         if let Some(state) = backend.owned_state(record)? {
             if state != "running" {
-                let allocation = project::lock(data, "port-forwarding", "allocation")?;
-                FileExt::lock_exclusive(&allocation)?;
+                let port_allocation = project::global_lock(data, "port-allocation")?;
+                FileExt::lock_exclusive(&port_allocation)?;
                 check_restart_ports(&record.ports)?;
-                backend.checked(&["start", &record.id]).context("could not restart container; if a saved host port is occupied, free it or run jail recreate to allocate new ports")?;
+                backend.checked(&["start", &record.container]).context("could not restart container; if a saved host port is occupied, free it or run jail recreate to allocate new ports")?;
             }
             wait_ready(backend, record)?;
             return Ok(record.clone());
@@ -121,8 +135,8 @@ pub fn ensure(
     build(backend, data, cfg, false)?;
     // Serialize jail's port selection and creation across different projects.
     // Other host apps can still race the final bind; the backend must fail safely.
-    let allocation = project::lock(data, "port-forwarding", "allocation")?;
-    FileExt::lock_exclusive(&allocation)?;
+    let port_allocation = project::global_lock(data, "port-allocation")?;
+    FileExt::lock_exclusive(&port_allocation)?;
     // jail cleanup may have removed the image after the build. Never let the
     // backend resolve a missing local tag from a registry instead.
     if !backend
@@ -133,16 +147,20 @@ pub fn ensure(
     {
         bail!("image {image} was removed during launch; retry");
     }
-    let id = if let Some(record) = &existing {
-        record.id.clone() // Retry a failed creation using the saved name.
+    let container = if let Some(record) = &existing {
+        record.container.clone() // Retry a failed creation using the saved name.
     } else {
         project.new_container_name()?
     };
     // Do not claim an existing container name whose state was lost.
-    if backend.list()?.iter().any(|v| container_id(v) == Some(&id)) {
+    if backend
+        .list()?
+        .iter()
+        .any(|v| container_id(v) == Some(&container))
+    {
         bail!(
-            "container name {} is already in use without matching jail state",
-            id
+            "container name {} is already in use without a matching jail record",
+            container
         );
     }
     if !backend
@@ -171,7 +189,7 @@ pub fn ensure(
         "run".into(),
         "--detach".into(),
         "--name".into(),
-        id.clone(),
+        container.clone(),
         "--label".into(),
         format!("io.jail.project={}", project.root.display()),
         "--label".into(),
@@ -211,7 +229,7 @@ pub fn ensure(
         "--mount".into(),
         format!("type=volume,source={volume},target=/home/jail"),
         "--env".into(),
-        format!("JAIL_POLICY={}", serde_json::to_string(cfg)?),
+        format!("JAIL_CONFIG_JSON={}", serde_json::to_string(cfg)?),
         "--env".into(),
         format!("JAIL_WRITE_GUARD={}", serde_json::to_string(&guard)?),
     ]);
@@ -242,14 +260,14 @@ pub fn ensure(
     // No host home, SSH agent or runtime socket is shared. Ports bind loopback only.
     args.push(image.clone());
     let record = Record {
-        id,
+        container,
         root: project.root.clone(),
         spec: spec.into(),
         image,
         volume,
         ports,
     };
-    // Save ownership metadata before creation so a failed startup is diagnosable.
+    // Save the record before creation so a failed startup is diagnosable.
     project.save(data, &record)?;
     drop(reservations); // Apple container now owns the binds, not jail.
     backend
@@ -308,10 +326,10 @@ fn wait_ready(backend: &Backend, record: &Record) -> Result<()> {
                 "exec",
                 "--user",
                 "root",
-                &record.id,
+                &record.container,
                 "test",
                 "-f",
-                "/run/jail-ready",
+                READY,
             ])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
@@ -321,5 +339,5 @@ fn wait_ready(backend: &Backend, record: &Record) -> Result<()> {
         }
         std::thread::sleep(Duration::from_millis(200));
     }
-    bail!("container did not become ready; policy setup may have failed. Inspect with: container logs {}", record.id)
+    bail!("container did not become ready; policy setup may have failed. Inspect with: container logs {}", record.container)
 }

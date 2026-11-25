@@ -8,6 +8,7 @@ use fs2::FileExt;
 use jail::{
     config::{Config, NetworkMode},
     network_policy::Denial,
+    GUEST,
 };
 use std::{fs, io::Write, os::unix::fs::OpenOptionsExt, path::Path, process::Stdio};
 
@@ -37,8 +38,8 @@ pub fn sync(backend: &Backend, record: &Record, cfg: &Config) -> Result<()> {
             "--interactive",
             "--user",
             "root",
-            &record.id,
-            "/usr/local/bin/jail-guest",
+            &record.container,
+            GUEST,
             "policy-set",
         ])
         .stdin(Stdio::piped())
@@ -68,8 +69,8 @@ pub fn run(
         print!("{}", toml::to_string_pretty(&cfg.network)?);
         return Ok(0);
     }
-    let lock = project::lock(data, &project.id, "lifecycle")?;
-    FileExt::lock_exclusive(&lock)?;
+    let lifecycle = project::lock(data, &project.key, "lifecycle")?;
+    FileExt::lock_exclusive(&lifecycle)?;
     let mut cfg = cfg.clone();
     if let Action::Allow { host, port } = &action {
         if cfg.network.mode != NetworkMode::Allowlist {
@@ -152,8 +153,8 @@ pub fn run(
                     "exec",
                     "--user",
                     "root",
-                    &record.id,
-                    "/usr/local/bin/jail-guest",
+                    &record.container,
+                    GUEST,
                     "policy-log",
                 ])
                 .output()?;
@@ -176,7 +177,7 @@ pub fn run(
             if let Some(record) = record {
                 if backend.owned_state(&record)?.as_deref() == Some("running") {
                     sync(backend, &record, &cfg)?;
-                    println!("reloaded {}", record.id);
+                    println!("reloaded {}", record.container);
                 } else {
                     println!("Container is stopped; policy will apply on next launch.");
                 }

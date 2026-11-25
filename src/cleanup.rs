@@ -3,7 +3,8 @@
 //! are refused, or skipped by --all-delete.
 use crate::{
     backend::{container_id, Backend},
-    project::{self, Project, Record},
+    project::{self, volume_key, Project, Record},
+    runtime::{build_context, image_name},
 };
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
@@ -25,21 +26,6 @@ pub enum Target {
     },
 }
 
-fn hex(s: &str, len: usize) -> bool {
-    s.len() == len
-        && s.bytes()
-            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-}
-fn volume_key(name: &str) -> Option<&str> {
-    let key = name.strip_suffix("-home")?;
-    hex(key.strip_prefix("jail-")?, 16).then_some(key)
-}
-fn image_name(name: &str) -> Option<&str> {
-    let name = name.strip_prefix("docker.io/library/").unwrap_or(name);
-    name.strip_prefix("jail-runtime:")
-        .is_some_and(|h| hex(h, 20))
-        .then_some(name)
-}
 fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
     match value {
         Value::String(s) => out.push(s),
@@ -58,7 +44,7 @@ fn users(containers: &[Value], records: &[Record], name: &str) -> Vec<String> {
         strings(entry, &mut text);
         let recorded = records
             .iter()
-            .any(|r| r.id == id && (r.volume == name || r.image == name));
+            .any(|r| r.container == id && (r.volume == name || r.image == name));
         if recorded || text.iter().any(|s| s.contains(name)) {
             out.push(id.to_owned());
         }
@@ -96,11 +82,11 @@ fn image_entry(entry: &Value) -> Option<&str> {
 /// Serialize with image builds and container creation, which re-checks the
 /// image under the allocation lock before running.
 fn image_locks(data: &Path) -> Result<[fs::File; 2]> {
-    let build = project::lock(data, "image", "build")?;
-    FileExt::lock_exclusive(&build)?;
-    let allocation = project::lock(data, "port-forwarding", "allocation")?;
-    FileExt::lock_exclusive(&allocation)?;
-    Ok([build, allocation])
+    let image_build = project::global_lock(data, "image-build")?;
+    FileExt::lock_exclusive(&image_build)?;
+    let port_allocation = project::global_lock(data, "port-allocation")?;
+    FileExt::lock_exclusive(&port_allocation)?;
+    Ok([image_build, port_allocation])
 }
 fn date(entry: &Value) -> &str {
     let date = entry
@@ -189,8 +175,8 @@ fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
 fn remove_volume(backend: &Backend, data: &Path, name: &str, skip_used: bool) -> Result<bool> {
     let key = volume_key(name).context("not a jail home volume")?;
     // Launch, stop and recreate of that project wait while this runs.
-    let mutation = project::lock(data, key, "lifecycle")?;
-    FileExt::lock_exclusive(&mutation)?;
+    let lifecycle = project::lock(data, key, "lifecycle")?;
+    FileExt::lock_exclusive(&lifecycle)?;
     let users = users(&backend.list()?, &project::records(data)?, name);
     if !users.is_empty() && skip_used {
         println!("skipped home volume {name}: in use by {}", users.join(", "));
@@ -228,8 +214,7 @@ fn remove_image(backend: &Backend, data: &Path, tag: &str, skip_used: bool) -> R
         bail!("image {tag} does not exist");
     }
     backend.checked(&["image", "delete", tag])?;
-    // The build context holds only jail source and version pins.
-    let context = data.join("build").join(tag.replace(':', "-"));
+    let context = build_context(data, tag);
     if context.exists() {
         fs::remove_dir_all(&context)?;
     }
@@ -266,7 +251,7 @@ fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Res
                     .and_then(Value::as_str)
                     .map(str::to_owned)
             })
-            .or_else(|| (key == project.id).then(|| project.root.display().to_string()))
+            .or_else(|| (key == project.key).then(|| project.root.display().to_string()))
             .unwrap_or_else(|| "project unknown".into());
         println!(
             "  {name}  {}  created {}  {root}",
