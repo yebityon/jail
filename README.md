@@ -115,6 +115,9 @@ jail --dry-run claude --resume
 | `jail config show` | Print the resolved configuration |
 | `jail update` | Rebuild the configured image |
 | `jail recreate` | Remove the current container; the next launch creates a new one |
+| `jail cleanup` | List jail home volumes and images, with the containers using them |
+| `jail cleanup volume NAME…` / `jail cleanup image TAG…` | Delete the named home volumes / images if no container uses them |
+| `jail cleanup --all-delete` | Delete every jail home volume and image that no container uses |
 | `jail doctor` | Check the host and container service |
 
 Use `jail --help` or `jail <command> --help` for command-specific options.
@@ -160,6 +163,19 @@ jail claude  # or jail codex
 ```
 
 > `recreate` deletes the container's root filesystem, including packages and files added outside its persistent home or shared mounts. It preserves the project's home volume, CLI settings/history and host files. Host login is re-imported on the next authenticated launch. `jail update` alone does not replace an existing container.
+
+Home volumes and images are never deleted automatically. `jail cleanup` lists jail's home volumes and images, each with its project path where known, creation date and the containers using it. Deletion runs only for the names you pass, or for every unused one with `--all-delete`:
+
+```sh
+jail cleanup
+jail cleanup volume jail-0123456789abcdef-home
+jail cleanup image jail-runtime:0123456789abcdef0123
+jail cleanup --all-delete
+```
+
+`--all-delete` asks for no confirmation. It deletes jail's home volumes and images one by one by name, skips and reports those in use, and never touches volumes or images in other formats.
+
+Only names in jail's own formats (`jail-<16 hex>-home`, `jail-runtime:<20 hex>`) are accepted. A volume or image used by any container is refused; to free a project's home volume, close its sessions and run `jail recreate` in that project first. Deleting a home volume permanently removes that project's CLI settings and history; the next launch creates an empty one. A deleted image is rebuilt when a configuration needs it again. New home volumes carry their project path as a label, so the path remains visible after jail state is removed.
 
 ## Development servers
 
@@ -244,6 +260,61 @@ deny_write = ["package.json", "scripts/trusted/"]
 
 Use a trailing `/` for missing directories. Set `protect_sensitive = false` to disable defaults; explicit `deny_write` still applies. Mount changes require `jail recreate`. Host-side edits remain possible and are outside the agent isolation boundary.
 
+### How allowlist enforcement works
+
+Two layers inside the VM enforce the allowlist. The firewall decides which local endpoints agent processes can reach. Root-owned services behind those endpoints decide which upstream hosts are reachable. Firewall rules match only the agent's UID, so the root proxy and gateway can reach the network, while agent processes cannot bypass them.
+
+```mermaid
+flowchart TD
+    agent["Agent process (non-root UID)<br/>HTTPS_PROXY=http://127.0.0.1:3128"] --> fw{"iptables / ip6tables<br/>rules for the agent UID"}
+    fw -->|"IPv4 TCP to 127.0.0.1:3128"| proxy["CONNECT proxy (root)"]
+    fw -->|"IPv4 TCP to 127.0.0.1:3130 or 3131"| gateway["Authentication gateway (root)"]
+    fw -->|"Reply from a published port"| reply["Allowed: reply to an inbound connection"]
+    fw -->|"Anything else: other TCP including other loopback ports,<br/>DNS, UDP, all IPv6"| rejected["REJECT"]
+    proxy --> connect{"CONNECT host:port?"}
+    connect -->|"No"| badrequest["405 or 400"]
+    connect -->|"Yes"| allowed{"Host matches allowed_hosts<br/>and port is in allowed_ports?"}
+    allowed -->|"No"| denied["403, logged as allowlist"]
+    allowed -->|"Yes"| resolve["Resolve DNS in the proxy"]
+    resolve --> public{"Every address public,<br/>or allow_private_ips = true?"}
+    public -->|"No"| private["403, logged as private_ip"]
+    public -->|"Yes"| tunnel["Connect to the resolved address<br/>and relay TLS bytes without decrypting"]
+    gateway --> route{"Fixed subscription route?"}
+    route -->|"No"| badgateway["502"]
+    route -->|"Yes"| upstream{"Upstream allowed on port 443?<br/>3130: api.anthropic.com<br/>3131: chatgpt.com"}
+    upstream -->|"No"| gatewaydenied["403, logged as auth_gateway_allowlist"]
+    upstream -->|"Yes"| inject["Require public IPs and pin one,<br/>inject OAuth, verify TLS"]
+```
+
+- The proxy decides only from the host name and port in the CONNECT line. It resolves DNS itself and connects to the address it resolved. TLS is relayed unchanged, so paths, headers and bodies are not checked.
+- The gateway always requires public upstream addresses, regardless of `allow_private_ips`.
+- In `open` mode no firewall is installed. In `none` mode all agent traffic is rejected, including the proxy and gateway ports.
+
+Policy changes reach a running container without restarting it:
+
+```mermaid
+sequenceDiagram
+    actor User
+    participant CLI as jail on the Mac
+    participant Config as Trusted config
+    participant Guest as Root jail-guest
+    participant Private as Root-only /run/jail-private
+    participant Proxy as Proxy and gateway
+    User->>CLI: jail policy allow HOST
+    CLI->>Config: Add host and port, keep comments
+    CLI->>Guest: policy-set, policy JSON over stdin
+    Guest->>Guest: Refuse mode or published-port changes
+    Guest->>Private: Validate, replace network.json atomically
+    Proxy->>Private: Read network.json for each new connection
+    Proxy->>Private: Append denials to denials.jsonl
+    User->>CLI: jail policy log
+    CLI->>Guest: policy-log
+    Guest->>Private: Read denials.jsonl
+    Guest-->>CLI: Time, host, port and reason
+```
+
+Each launch also sends the trusted config's network policy to the container. Manual edits therefore apply on the next launch, or immediately with `jail policy reload`.
+
 ### Adjusting an allowlist
 
 In `network.mode = "allowlist"`, inspect denials and approve a destination explicitly:
@@ -262,15 +333,19 @@ The root-only journal contains time, hostname, port and reason—not URLs, heade
 
 ## Authentication
 
-**Subscription login only; no API keys.** jail reuses Claude / ChatGPT host login from files or macOS Keychain. Credentials travel over standard input into a root-only authentication gateway in guest tmpfs (`/run/jail-private`, mode `0700`; files `0600`). The agent receives synthetic OAuth placeholders, never real access/refresh/ID tokens. Nothing is written back to the host.
+**Subscription login only; no API keys.** jail reuses Claude / ChatGPT host login from files or macOS Keychain. Credentials travel over standard input into a root-only authentication gateway in guest tmpfs (`/run/jail-private`, mode `0700`; files `0600`). The agent receives synthetic OAuth placeholders, never real access/refresh/ID tokens. Existing host credentials are not overwritten.
 
 - Host settings, skills, MCP configuration, and conversation history are not copied.
 - Each project has a separate persistent guest home for settings, history and placeholder auth; real credentials do not persist there.
-- Missing credentials, denied Keychain access or unsupported formats fail clearly. Sign in with native `claude` / `codex` **on the host**, then run `jail auth claude` / `jail auth codex`. Container login/logout and API-key environment forwarding are rejected.
-- Credentials are not continuously synchronized or written back to the host. To refresh them explicitly, close active sessions and run `jail auth claude` or `jail auth codex`.
-- Set `auth.import_host = false` to disable automatic import; explicit `jail auth` is still available. Credentials vanish on stop and are imported again on the next authenticated launch.
+- Interactive sessions can start without host credentials; sign in on the Mac and the session receives the login. Import failures such as denied Keychain access or unsupported formats still report an error. Direct container CLI login/logout and API-key environment forwarding are rejected.
+- During an authenticated session, jail checks every 15 seconds whether the host login changed. The check uses file metadata or Keychain attributes and does not read the password. When the official CLI on the Mac refreshes or replaces its login, jail reads it once and sends it to the running gateway. The gateway accepts it only if its access token expires later than the current one, so an older copy read by another session never replaces a newer login. One session per project and tool performs the check. Failures are reported after the session ends.
+- jail does not refresh OAuth tokens or write host credentials. If the host CLI does not refresh its login, the gateway is not refreshed either. If Keychain access was allowed only once, macOS may ask again when the item changes; a denied read is retried after the next change.
+- To force a re-import, close active sessions and run `jail auth claude` or `jail auth codex`.
+- Set `auth.import_host = false` to disable automatic import and host-login sync; explicit `jail auth` is still available. Credentials vanish on stop and are imported again on the next authenticated launch.
 
-The gateway injects OAuth only for fixed HTTPS subscription endpoints (`api.anthropic.com` and `chatgpt.com`), verifies TLS, pins resolved public IPs, and never follows redirects. It obeys network policy, including `none`. Claude uses its subscription-preserving base-URL setting; Codex uses an OAuth-backed custom provider with HTTP/SSE rather than WebSocket transport. Provider-specific Codex resume lists may differ from older sessions. Endpoint compatibility is limited to the pinned CLI versions; cloud, account-management and arbitrary gateway routes are not supported. Automatic refresh during a running session is not implemented: refresh host login and re-import if it expires.
+The gateway injects OAuth only for fixed HTTPS subscription endpoints (`api.anthropic.com` and `chatgpt.com`), verifies TLS, pins resolved public IPs, and never follows redirects. It obeys network policy, including `none`. Claude uses its subscription-preserving base-URL setting; Codex uses an OAuth-backed custom provider with HTTP/SSE rather than WebSocket transport. Provider-specific Codex resume lists may differ from older sessions. Endpoint compatibility is limited to the pinned CLI versions; cloud, account-management and arbitrary gateway routes are not supported. The gateway does not refresh tokens itself. If login expires and the host login has not been refreshed, run `claude auth login` or `codex login` on the Mac, then retry the failed request.
+
+**Sign in only on the Mac.** jail never runs a login itself and has no command for signing in from a session. Run `claude auth login` or `codex login` on the Mac; with `auth.import_host = true`, running sessions receive the new login within about 15 seconds. In an interactive terminal, a `/login` typed at the start of a line (including Tab completion from `/log`) is answered by jail: it is not passed to the agent CLI, and jail shows the command to run on the Mac. Arrow-key menu selections and pasted commands are not interpreted and reach the agent CLI. Do not complete a login started that way inside the container: the CLI there could store real tokens in the agent-readable home volume.
 
 Known legacy guest auth files are replaced with placeholders on startup. Existing credential copies elsewhere are not discovered or deleted; a previously exposed token cannot be made secret retroactively. The gateway is **inside the VM**, not an external host-side credential service: it and the root supervisor remain trusted, and an agent can use authorized inference without learning the token.
 
@@ -305,7 +380,7 @@ Other current limitations:
 
 - The guest runs Linux. Host Homebrew tools and macOS-only commands are not available there.
 - Git worktrees whose metadata lives outside the shared workspace are not automatically supported.
-- Custom images for system packages, auth-refresh synchronization, explicit cleanup of unused home volumes/images, and operation history are on the [roadmap](TODO.md).
+- Custom images for system packages and operation history are on the [roadmap](TODO.md).
 - Codex uses its bundled bubblewrap sandbox. Injected configuration can select embedded mode instead of a shared background server and produce a corresponding warning.
 
 ## Troubleshooting
@@ -328,7 +403,7 @@ Close active sessions, then run `jail recreate` from the affected project. Revie
 
 ### Authentication is missing or expired
 
-Sign in on the host, close active sessions, then re-import with `jail auth claude` / `jail auth codex`. Host login changes are not continuously synchronized. API keys are not a fallback.
+Run `claude auth login` or `codex login` on the Mac. Running sessions receive the new login, or a login the host CLI refreshed, within about 15 seconds; retry the failed request. With `auth.import_host = false`, close active sessions and run `jail auth claude` / `jail auth codex`. There is no API-key fallback.
 
 ### A saved host port is already occupied
 

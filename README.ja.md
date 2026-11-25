@@ -115,6 +115,9 @@ jail --dry-run claude --resume
 | `jail config show` | 解決済みの設定を表示 |
 | `jail update` | 設定したイメージを再構築 |
 | `jail recreate` | 現在のコンテナを削除し、次回起動で新規作成 |
+| `jail cleanup` | jailのホームvolume・イメージと、それを使うコンテナを一覧表示 |
+| `jail cleanup volume NAME…` / `jail cleanup image TAG…` | 指定したホームvolume・イメージを、使うコンテナがなければ削除 |
+| `jail cleanup --all-delete` | コンテナが使っていないjailのホームvolume・イメージをすべて削除 |
 | `jail doctor` | ホストとcontainerサービスを確認 |
 
 詳細なオプションは`jail --help`・`jail <command> --help`で確認できます。
@@ -160,6 +163,19 @@ jail claude  # または jail codex
 ```
 
 > `recreate`はコンテナのルートファイルシステムを削除します。永続ホームや共有マウントの外に追加したファイル・パッケージは失われます。ホームvolume・CLIの設定／履歴・ホストファイルは保持し、次の認証付き起動でホストログインを再取り込みします。`jail update`だけでは既存コンテナを置き換えません。
+
+ホームvolumeとイメージは自動では削除しません。`jail cleanup`は、jailのホームvolumeとイメージを一覧表示します。各項目には、分かる範囲でプロジェクトのパス、作成日、使用中のコンテナを示します。削除するのは、指定した名前か、`--all-delete`を付けた場合の未使用のものすべてです。
+
+```sh
+jail cleanup
+jail cleanup volume jail-0123456789abcdef-home
+jail cleanup image jail-runtime:0123456789abcdef0123
+jail cleanup --all-delete
+```
+
+`--all-delete`は確認を求めません。jailのホームvolumeとイメージを名前で1件ずつ削除します。使用中のものは削除せずに表示し、jailの形式ではないvolume・イメージには触れません。
+
+受け付ける名前は、jail自身の形式（`jail-<16桁の16進数>-home`・`jail-runtime:<20桁の16進数>`）だけです。いずれかのコンテナが使っているvolume・イメージは削除しません。プロジェクトのホームvolumeを削除するには、先にそのセッションを閉じ、そのプロジェクトで`jail recreate`を実行してください。ホームvolumeを削除すると、そのプロジェクトのCLI設定と履歴は元に戻せません。次回起動では空のvolumeを作成します。削除したイメージは、設定が再び必要とした時点で再ビルドします。新しく作るホームvolumeにはプロジェクトのパスをラベルとして付けるため、jailの状態ファイルを削除した後もパスを表示できます。
 
 ## 開発サーバー
 
@@ -244,6 +260,61 @@ deny_write = ["package.json", "scripts/trusted/"]
 
 存在しないディレクトリには末尾`/`を付けます。`protect_sensitive = false`で既定の対象を無効化できますが、明示した`deny_write`は有効です。マウント変更には`jail recreate`が必要です。ホストからの編集は可能で、隔離の対象外です。
 
+### 許可リストの制御の仕組み
+
+許可リストは、VM内の2つの層で強制します。ファイアウォールは、エージェントのプロセスが接続できるローカルの接続先を決めます。その先にあるrootのサービスが、接続できる上流のホストを決めます。ファイアウォールのルールはエージェントのUIDだけに適用します。そのため、rootのプロキシとゲートウェイは外部へ接続できますが、エージェントのプロセスはそれらを迂回できません。
+
+```mermaid
+flowchart TD
+    agent["エージェントのプロセス（非rootのUID）<br/>HTTPS_PROXY=http://127.0.0.1:3128"] --> fw{"iptables / ip6tables<br/>エージェントUIDのルール"}
+    fw -->|"127.0.0.1:3128へのIPv4 TCP"| proxy["CONNECTプロキシ（root）"]
+    fw -->|"127.0.0.1:3130・3131へのIPv4 TCP"| gateway["認証ゲートウェイ（root）"]
+    fw -->|"公開ポートからの返信"| reply["許可：受信接続への返信"]
+    fw -->|"それ以外：他のloopbackポートを含むTCP、<br/>DNS、UDP、すべてのIPv6"| rejected["REJECT"]
+    proxy --> connect{"CONNECT host:port か"}
+    connect -->|"いいえ"| badrequest["405または400"]
+    connect -->|"はい"| allowed{"ホストがallowed_hostsに一致し、<br/>ポートがallowed_portsに含まれるか"}
+    allowed -->|"いいえ"| denied["403、理由allowlistで記録"]
+    allowed -->|"はい"| resolve["プロキシが名前解決"]
+    resolve --> public{"すべて公開IPか、<br/>allow_private_ips = trueか"}
+    public -->|"いいえ"| private["403、理由private_ipで記録"]
+    public -->|"はい"| tunnel["解決したアドレスへ接続し、<br/>TLSを復号せずに中継"]
+    gateway --> route{"固定のサブスクリプション用ルートか"}
+    route -->|"いいえ"| badgateway["502"]
+    route -->|"はい"| upstream{"上流が443番で許可されているか<br/>3130：api.anthropic.com<br/>3131：chatgpt.com"}
+    upstream -->|"いいえ"| gatewaydenied["403、理由auth_gateway_allowlistで記録"]
+    upstream -->|"はい"| inject["公開IPを必須にして1つに固定し、<br/>OAuthを注入、TLSを検証"]
+```
+
+- プロキシは、CONNECT行のホスト名とポートだけで判定します。名前解決はプロキシ自身が行い、解決したアドレスへ接続します。TLSはそのまま中継するため、パス・ヘッダー・本文は検査しません。
+- ゲートウェイは`allow_private_ips`の設定にかかわらず、上流に公開IPを必須とします。
+- `open`ではファイアウォールを設定しません。`none`では、プロキシとゲートウェイのポートを含め、エージェントの通信をすべて拒否します。
+
+許可リストの変更は、再起動せずに実行中のコンテナへ反映します。
+
+```mermaid
+sequenceDiagram
+    actor User as ユーザー
+    participant CLI as Macのjail
+    participant Config as 信頼済みの設定ファイル
+    participant Guest as rootのjail-guest
+    participant Private as root専用の/run/jail-private
+    participant Proxy as プロキシとゲートウェイ
+    User->>CLI: jail policy allow HOST
+    CLI->>Config: ホストとポートを追加し、コメントを維持
+    CLI->>Guest: policy-set、標準入力でポリシーのJSONを送信
+    Guest->>Guest: モードと公開ポートの変更を拒否
+    Guest->>Private: 検証し、network.jsonを原子的に置換
+    Proxy->>Private: 新しい接続ごとにnetwork.jsonを読む
+    Proxy->>Private: 拒否をdenials.jsonlへ追記
+    User->>CLI: jail policy log
+    CLI->>Guest: policy-log
+    Guest->>Private: denials.jsonlを読む
+    Guest-->>CLI: 時刻・ホスト・ポート・理由
+```
+
+起動のたびに、信頼済みの設定ファイルの通信ポリシーもコンテナへ送ります。そのため、設定ファイルを手動で編集した変更は、次回の起動時か、`jail policy reload`の実行時に反映します。
+
 ### 許可リストの調整
 
 `network.mode = "allowlist"`で通信拒否を確認し、必要な接続先を明示的に許可できます。
@@ -262,15 +333,19 @@ root専用のログには時刻・ホスト名・ポート・拒否理由だけ�
 
 ## 認証
 
-**サブスクリプションのログイン専用で、APIキーは使いません。** ホストのファイル／macOS KeychainにあるClaude・ChatGPTのログインを再利用します。実トークンは標準入力でゲストのroot専用認証ゲートウェイへ送り、tmpfsの`/run/jail-private`（`0700`、ファイルは`0600`）だけに保持します。エージェントにはダミーOAuth情報を渡し、実際のaccess・refresh・ID tokenは渡しません。ホストへの書き戻しはしません。
+**サブスクリプションのログイン専用で、APIキーは使いません。** ホストのファイル／macOS KeychainにあるClaude・ChatGPTのログインを再利用します。実トークンは標準入力でゲストのroot専用認証ゲートウェイへ送り、tmpfsの`/run/jail-private`（`0700`、ファイルは`0600`）だけに保持します。エージェントにはダミーOAuth情報を渡し、実際のaccess・refresh・ID tokenは渡しません。既存のホスト認証への書き戻しはしません。
 
 - ホストの設定・skills・MCP・会話履歴はコピーしません。
 - 設定・履歴・ダミー認証はプロジェクト専用の永続ホームに保持します。実トークンは永続化しません。
-- 情報がない場合、Keychain拒否・非対応形式はエラーにします。**ホスト側**で通常の`claude`・`codex`にログイン後、`jail auth claude`・`jail auth codex`を実行してください。コンテナ内のログイン／ログアウトと、APIキーの環境変数転送は拒否します。
-- 認証情報は継続同期せず、ホストへ書き戻しません。明示的に更新するには使用中のセッションを閉じ、`jail auth claude`・`jail auth codex`を実行してください。
-- `auth.import_host = false`で自動取り込みを無効にできます。明示的な`jail auth`は利用可能です。実トークンは停止時に消え、次の認証付き起動で再取り込みします。
+- ホスト認証がない場合も対話セッションを起動できます。Macでログインすると、セッションへ反映されます。Keychain拒否・非対応形式などで取り込みに失敗した場合はエラーになります。コンテナのCLIを直接使うログイン／ログアウトと、APIキーの環境変数転送は拒否します。
+- 認証付きセッションの実行中は、ホスト認証が変わったかを15秒ごとに確認します。確認にはファイルのメタデータかKeychainの属性を使い、パスワードは読みません。Macの公式CLIがログインを更新または置換すると、jailはそれを1回だけ読み、実行中のゲートウェイへ送ります。ゲートウェイは、受け取ったアクセストークンの期限が現在より後の場合だけ採用します。そのため、別のセッションが読んだ古い認証が、新しい認証を上書きすることはありません。確認はプロジェクトとツールごとに1セッションだけが行います。失敗はセッション終了後に表示します。
+- jail自身はOAuthトークンを更新せず、ホストの認証情報にも書き込みません。ホストのCLIが更新しなければ、ゲートウェイも更新されません。Keychainのアクセスを1回だけ許可した場合、項目が変わるとmacOSが再度確認することがあります。拒否した場合は、次に項目が変わったときに再試行します。
+- 強制的に再取り込みする場合は、セッションを閉じて`jail auth claude`・`jail auth codex`を実行します。
+- `auth.import_host = false`で自動取り込みとホスト認証の同期を無効にできます。明示的な`jail auth`は利用可能です。実トークンは停止時に消え、次の認証付き起動で再取り込みします。
 
-ゲートウェイは固定のHTTPSサブスクリプション接続先（`api.anthropic.com`・`chatgpt.com`）にだけOAuthを注入します。TLS検証・公開IPへの接続固定・リダイレクト拒否を行い、`none`を含む通信ポリシーに従います。Claudeはサブスクリプションを維持するbase URL設定、CodexはOAuth認証付きのカスタムproviderでHTTP/SSEを使います。WebSocketは使わず、Codexのprovider別resume一覧は以前と異なる場合があります。対応するendpointは固定CLIバージョン向けに限定し、cloud・アカウント管理・任意ルートには対応しません。実行中の自動更新は未対応のため、期限切れ時はホストのログインを更新して再取り込みしてください。
+ゲートウェイは固定のHTTPSサブスクリプション接続先（`api.anthropic.com`・`chatgpt.com`）にだけOAuthを注入します。TLS検証・公開IPへの接続固定・リダイレクト拒否を行い、`none`を含む通信ポリシーに従います。Claudeはサブスクリプションを維持するbase URL設定、CodexはOAuth認証付きのカスタムproviderでHTTP/SSEを使います。WebSocketは使わず、Codexのprovider別resume一覧は以前と異なる場合があります。対応するendpointは固定CLIバージョン向けに限定し、cloud・アカウント管理・任意ルートには対応しません。ゲートウェイ自身はトークンを更新しません。期限が切れてホスト認証も更新されていない場合は、Macで`claude auth login`または`codex login`を実行し、失敗したリクエストを再実行してください。
+
+**ログインはMacでだけ行います。** jail自身はログインを実行せず、セッションからログインするコマンドもありません。Macで`claude auth login`または`codex login`を実行してください。`auth.import_host = true`であれば、約15秒以内に実行中のセッションへ反映されます。対話端末で行頭から`/login`を手入力した場合（`/log`からのTab補完を含む）は、jailが受け取ります。エージェントのCLIには渡さず、Macで実行するコマンドを表示します。矢印キーによるメニュー選択や貼り付けたコマンドは判定しないため、エージェントのCLIに届きます。その方法でコンテナ内のログインが始まっても、完了させないでください。コンテナ内のCLIが、エージェントから読めるホームvolumeに実トークンを保存する可能性があります。
 
 起動時に既知の旧ゲスト認証ファイルをダミーへ置換します。別の場所にコピーされた情報は探索・削除せず、一度露出したトークンを後から秘密にはできません。ゲートウェイは**VM内**にあり、ホスト側の外部認証サービスではありません。rootの監督プロセスとゲートウェイは信頼対象です。エージェントはトークンを読めなくても、許可された推論を利用できます。
 
@@ -305,7 +380,7 @@ CLI本来のツール制限は多層防御であり、**任意プログラムへ
 
 - ゲストはLinuxです。ホストのHomebrewツールやmacOS専用コマンドは使えません。
 - 共有範囲外にメタデータがあるGit worktreeは自動対応しません。
-- システムパッケージ用のカスタムイメージ、認証更新の同期、不要なホームvolume・イメージの明示削除、操作履歴は[ロードマップ](TODO.md)に記載しています。
+- システムパッケージ用のカスタムイメージ、操作履歴は[ロードマップ](TODO.md)に記載しています。
 - Codexは同梱のbubblewrapサンドボックスを使います。注入する設定により、共有バックグラウンドサーバーではなく組み込みモードになり、対応する警告が出る場合があります。
 
 ## トラブルシューティング
@@ -328,7 +403,7 @@ CLI本来のツール制限は多層防御であり、**任意プログラムへ
 
 ### 認証情報がない・失効している
 
-ホスト側でログインし、使用中のセッションを閉じて`jail auth claude`・`jail auth codex`で再取り込みします。ホストのログイン更新は継続同期せず、APIキーへのフォールバックもしません。
+Macで`claude auth login`または`codex login`を実行してください。新しいログインや、ホストのCLIが更新したログインは、約15秒以内に実行中のセッションへ反映されます。その後、失敗したリクエストを再実行してください。`auth.import_host = false`の場合は、セッションを閉じて`jail auth claude`・`jail auth codex`を実行します。APIキーへのフォールバックはしません。
 
 ### 保存済みのホストポートが使用中になった
 
