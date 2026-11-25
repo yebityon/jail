@@ -95,19 +95,8 @@ pub fn agent_args(tool: &str, args: &[String], c: &Config) -> Result<Vec<String>
     }
     let mut out = Vec::new();
     if tool == "claude" {
-        let mut deny = vec![];
-        deny.extend(c.tools.claude_deny.iter().map(String::as_str));
-        if !c.tools.shell {
-            deny.extend(["Bash", "PowerShell", "REPL", "Agent", "Task"]);
-        }
-        if !c.tools.edit {
-            deny.extend(["Edit", "Write", "NotebookEdit"]);
-        }
-        if !c.tools.web_search {
-            deny.extend(["WebSearch", "WebFetch"]);
-        }
+        let deny = claude_deny(c);
         if !c.tools.mcp {
-            deny.push("mcp__*");
             out.extend([
                 "--strict-mcp-config".into(),
                 "--mcp-config".into(),
@@ -160,7 +149,8 @@ pub fn agent_args(tool: &str, args: &[String], c: &Config) -> Result<Vec<String>
     Ok(out)
 }
 
-pub fn claude_settings(c: &Config) -> serde_json::Value {
+/// One list for both the --disallowedTools flag and managed settings.
+fn claude_deny(c: &Config) -> Vec<&str> {
     let mut deny = vec![];
     deny.extend(c.tools.claude_deny.iter().map(String::as_str));
     if !c.tools.shell {
@@ -175,8 +165,12 @@ pub fn claude_settings(c: &Config) -> serde_json::Value {
     if !c.tools.mcp {
         deny.push("mcp__*");
     }
+    deny
+}
+
+pub fn claude_settings(c: &Config) -> serde_json::Value {
     serde_json::json!({
-        "permissions": { "deny": deny },
+        "permissions": { "deny": claude_deny(c) },
         "disableAllHooks": !c.tools.hooks,
         "allowManagedPermissionRulesOnly": true,
         "allowManagedHooksOnly": !c.tools.hooks,
@@ -247,6 +241,22 @@ mod tests {
             assert!(agent_args("codex", &args, &c).is_err());
         }
         assert!(agent_args("claude", &["--tools=default".into()], &c).is_err());
+    }
+    #[test]
+    fn claude_flag_and_managed_settings_deny_the_same_tools() {
+        let mut c = Config::default();
+        c.tools.claude_deny.push("Read".into());
+        c.tools.shell = false;
+        c.tools.edit = false;
+        c.tools.web_search = false;
+        let args = agent_args("claude", &[], &c).unwrap();
+        let flag = &args[args.iter().position(|a| a == "--disallowedTools").unwrap() + 1];
+        let settings: Vec<String> =
+            serde_json::from_value(claude_settings(&c)["permissions"]["deny"].clone()).unwrap();
+        assert_eq!(flag, &settings.join(","));
+        for tool in ["Read", "Bash", "Edit", "WebSearch", "mcp__*"] {
+            assert!(settings.iter().any(|s| s == tool), "{tool}");
+        }
     }
     #[test]
     fn disabled_codex_features_are_managed_requirements() {

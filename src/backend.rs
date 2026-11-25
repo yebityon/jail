@@ -3,8 +3,35 @@ use anyhow::{bail, Context, Result};
 use serde_json::Value;
 use std::{
     ffi::OsString,
+    path::Path,
     process::{Command, Stdio},
 };
+
+// Container JSON layouts differ between backend versions; read them only here.
+pub fn container_id(entry: &Value) -> Option<&str> {
+    entry
+        .get("id")
+        .or_else(|| entry.pointer("/configuration/id"))
+        .and_then(Value::as_str)
+}
+/// Whether the ownership label names `root`. Accepts a list entry or
+/// `inspect` output, which wraps the container in an array.
+pub fn labeled_for(value: &Value, root: &Path) -> bool {
+    let entry = value.as_array().and_then(|a| a.first()).unwrap_or(value);
+    entry
+        .pointer("/configuration/labels/io.jail.project")
+        .or_else(|| entry.pointer("/labels/io.jail.project"))
+        .and_then(Value::as_str)
+        == Some(root.to_string_lossy().as_ref())
+}
+pub fn container_state(entry: &Value) -> Option<String> {
+    entry
+        .pointer("/status/state")
+        .or_else(|| entry.get("status"))
+        .or_else(|| entry.get("state"))
+        .and_then(Value::as_str)
+        .map(str::to_ascii_lowercase)
+}
 
 pub struct Backend {
     bin: OsString,
@@ -74,40 +101,22 @@ impl Backend {
     }
     pub fn owned_state(&self, record: &Record) -> Result<Option<String>> {
         for entry in self.list()? {
-            let id = entry
-                .get("id")
-                .or_else(|| entry.pointer("/configuration/id"))
-                .and_then(Value::as_str);
-            if id != Some(&record.id) {
+            if container_id(&entry) != Some(&record.id) {
                 continue;
             }
-            let label = entry
-                .pointer("/configuration/labels/io.jail.project")
-                .or_else(|| entry.pointer("/labels/io.jail.project"));
-            if label.and_then(Value::as_str) != Some(record.root.to_string_lossy().as_ref()) {
+            if !labeled_for(&entry, &record.root) {
                 // Some list versions omit labels, so inspect the exact container.
                 let inspected: Value =
                     serde_json::from_slice(&self.capture(&["inspect", &record.id])?)?;
-                let inspected = inspected
-                    .as_array()
-                    .and_then(|a| a.first())
-                    .unwrap_or(&inspected);
-                let label = inspected
-                    .pointer("/configuration/labels/io.jail.project")
-                    .or_else(|| inspected.pointer("/labels/io.jail.project"));
-                if label.and_then(Value::as_str) != Some(record.root.to_string_lossy().as_ref()) {
+                if !labeled_for(&inspected, &record.root) {
                     bail!(
                         "refusing to use container {}: ownership label mismatch",
                         record.id
                     );
                 }
             }
-            return entry
-                .pointer("/status/state")
-                .or_else(|| entry.get("status"))
-                .or_else(|| entry.get("state"))
-                .and_then(Value::as_str)
-                .map(|s| Some(s.to_ascii_lowercase()))
+            return container_state(&entry)
+                .map(Some)
                 .context("container state is missing");
         }
         Ok(None)
@@ -135,5 +144,32 @@ impl Backend {
         }
         println!("host authentication will be imported on first launch; no credential contents are printed");
         Ok(0)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    #[test]
+    fn both_container_json_layouts_are_read() {
+        let root = Path::new("/work/app");
+        let flat =
+            json!({"id": "a", "labels": {"io.jail.project": "/work/app"}, "status": "Running"});
+        let nested = json!({"configuration": {"id": "b", "labels": {"io.jail.project": "/work/app"}},
+            "status": {"state": "stopped"}});
+        assert_eq!(container_id(&flat), Some("a"));
+        assert_eq!(container_id(&nested), Some("b"));
+        assert!(labeled_for(&flat, root) && labeled_for(&nested, root));
+        assert!(labeled_for(&json!([nested]), root));
+        assert!(!labeled_for(&flat, Path::new("/work/other")));
+        assert!(!labeled_for(&json!([]), root));
+        assert_eq!(container_state(&flat).as_deref(), Some("running"));
+        assert_eq!(container_state(&nested).as_deref(), Some("stopped"));
+        assert_eq!(
+            container_state(&json!({"state": "Exited"})).as_deref(),
+            Some("exited")
+        );
+        assert_eq!(container_state(&json!({"id": "c"})), None);
     }
 }
