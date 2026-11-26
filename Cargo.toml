@@ -27,7 +27,7 @@ path = "src/shared/lib.rs"
 
 [[bin]]
 name = "jail"
-path = "src/mac/main.rs"
+path = "src/host/main.rs"
 
 [[bin]]
 name = "jail-guest"

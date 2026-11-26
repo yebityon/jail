@@ -1,5 +1,6 @@
 use crate::{
-    backend::Backend,
+    apple_container::Client,
+    backend,
     project::{self, Project, Record},
 };
 use anyhow::{bail, Context, Result};
@@ -30,18 +31,13 @@ pub enum Action {
     /// Apply allowlist changes without restarting; mode/forwarding changes need recreate.
     Reload,
 }
-pub fn sync(backend: &Backend, record: &Record, cfg: &Config) -> Result<()> {
-    backend.require_owned(record)?;
-    let mut child = backend
-        .command(&[
-            "exec",
-            "--interactive",
-            "--user",
-            "root",
-            &record.container,
-            GUEST,
-            "policy-set",
-        ])
+pub fn sync(client: &Client, record: &Record, cfg: &Config) -> Result<()> {
+    backend::require_owned(client, record)?;
+    let mut child = client
+        .exec(&record.container)
+        .interactive()
+        .user("root")
+        .command(&[GUEST, "policy-set"])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .spawn()?;
@@ -61,7 +57,7 @@ pub fn run(
     action: Action,
     path: &Path,
     cfg: &Config,
-    backend: &Backend,
+    client: &Client,
     data: &Path,
     project: &Project,
 ) -> Result<i32> {
@@ -147,16 +143,11 @@ pub fn run(
     match action {
         Action::Log { json } => {
             let record = record.context("no container for this project")?;
-            backend.require_owned(&record)?;
-            let out = backend
-                .command(&[
-                    "exec",
-                    "--user",
-                    "root",
-                    &record.container,
-                    GUEST,
-                    "policy-log",
-                ])
+            backend::require_owned(client, &record)?;
+            let out = client
+                .exec(&record.container)
+                .user("root")
+                .command(&[GUEST, "policy-log"])
                 .output()?;
             if !out.status.success() {
                 bail!("could not read policy log; container must be running");
@@ -175,8 +166,8 @@ pub fn run(
         }
         Action::Allow { .. } | Action::Reload => {
             if let Some(record) = record {
-                if backend.owned_state(&record)?.as_deref() == Some("running") {
-                    sync(backend, &record, &cfg)?;
+                if backend::owned_state(client, &record)?.as_deref() == Some("running") {
+                    sync(client, &record, &cfg)?;
                     println!("reloaded {}", record.container);
                 } else {
                     println!("Container is stopped; policy will apply on next launch.");

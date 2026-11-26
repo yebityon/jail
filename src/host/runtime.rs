@@ -1,5 +1,6 @@
 use crate::{
-    backend::{container_id, Backend},
+    apple_container::{Client, Run},
+    backend::{self, PROJECT_LABEL},
     project::{self, Port, Project, Record},
 };
 use anyhow::{bail, Context, Result};
@@ -18,7 +19,7 @@ use std::{
 const FILES: &[(&str, &str)] = &[
     ("Cargo.toml", include_str!("../../Cargo.toml")),
     ("Cargo.lock", include_str!("../../Cargo.lock")),
-    ("src/mac/main.rs", "fn main() {}\n"),
+    ("src/host/main.rs", "fn main() {}\n"),
     ("src/shared/lib.rs", include_str!("../shared/lib.rs")),
     ("src/shared/config.rs", include_str!("../shared/config.rs")),
     (
@@ -74,17 +75,11 @@ pub fn image_name(name: &str) -> Option<&str> {
 pub fn build_context(data: &Path, image: &str) -> PathBuf {
     data.join("build").join(image.replace(':', "-"))
 }
-pub fn build(backend: &Backend, data: &Path, cfg: &Config, force: bool) -> Result<String> {
+pub fn build(client: &Client, data: &Path, cfg: &Config, force: bool) -> Result<String> {
     let image = image_tag(cfg);
     let image_build = project::global_lock(data, "image-build")?;
     FileExt::lock_exclusive(&image_build)?;
-    if !force
-        && backend
-            .command(&["image", "inspect", &image])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-    {
+    if !force && client.image_exists(&image) {
         return Ok(image);
     }
     let context = build_context(data, &image);
@@ -97,30 +92,21 @@ pub fn build(backend: &Backend, data: &Path, cfg: &Config, force: bool) -> Resul
     fs::write(context.join("Cargo.lock"), include_str!("../../Cargo.lock"))?;
     // This build context contains source and version pins only, never a workspace or credentials.
     eprintln!("jail: building CLI image (first launch can take several minutes)");
-    let mut args = vec![
-        "build".into(),
-        "--tag".into(),
-        image.clone(),
-        "--build-arg".into(),
-        format!("CLAUDE_VERSION={}", cfg.image.claude_version),
-        "--build-arg".into(),
-        format!("CODEX_VERSION={}", cfg.image.codex_version),
-        "--build-arg".into(),
-        format!("JAIL_UID={}", unsafe { libc::getuid() }),
-        "--build-arg".into(),
-        format!("JAIL_GID={}", unsafe { libc::getgid() }),
-    ];
-    if force {
-        args.extend(["--no-cache".into(), "--pull".into()]);
-    }
-    args.push(context.to_string_lossy().into_owned());
-    if backend.interactive(&args)? != 0 {
-        bail!("image build failed");
-    }
+    client.build(
+        &image,
+        &[
+            ("CLAUDE_VERSION", cfg.image.claude_version.to_string()),
+            ("CODEX_VERSION", cfg.image.codex_version.to_string()),
+            ("JAIL_UID", unsafe { libc::getuid() }.to_string()),
+            ("JAIL_GID", unsafe { libc::getgid() }.to_string()),
+        ],
+        force,
+        &context,
+    )?;
     Ok(image)
 }
 pub fn ensure(
-    backend: &Backend,
+    client: &Client,
     data: &Path,
     project: &Project,
     cfg: &Config,
@@ -136,30 +122,25 @@ pub fn ensure(
         if record.spec != spec {
             bail!("configuration or image changed; close sessions, then run jail recreate (home/history persist, host login is re-imported; installed OS packages will be removed)");
         }
-        if let Some(state) = backend.owned_state(record)? {
+        if let Some(state) = backend::owned_state(client, record)? {
             if state != "running" {
                 let port_allocation = project::global_lock(data, "port-allocation")?;
                 FileExt::lock_exclusive(&port_allocation)?;
                 check_restart_ports(&record.ports)?;
-                backend.checked(&["start", &record.container]).context("could not restart container; if a saved host port is occupied, free it or run jail recreate to allocate new ports")?;
+                client.start(&record.container).context("could not restart container; if a saved host port is occupied, free it or run jail recreate to allocate new ports")?;
             }
-            wait_ready(backend, record)?;
+            wait_ready(client, record)?;
             return Ok(record.clone());
         }
     }
-    build(backend, data, cfg, false)?;
+    build(client, data, cfg, false)?;
     // Serialize jail's port selection and creation across different projects.
     // Other host apps can still race the final bind; the backend must fail safely.
     let port_allocation = project::global_lock(data, "port-allocation")?;
     FileExt::lock_exclusive(&port_allocation)?;
     // jail cleanup may have removed the image after the build. Never let the
     // backend resolve a missing local tag from a registry instead.
-    if !backend
-        .command(&["image", "inspect", &image])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !client.image_exists(&image) {
         bail!("image {image} was removed during launch; retry");
     }
     let container = if let Some(record) = &existing {
@@ -168,30 +149,18 @@ pub fn ensure(
         project.new_container_name()?
     };
     // Do not claim an existing container name whose state was lost.
-    if backend
-        .list()?
-        .iter()
-        .any(|v| container_id(v) == Some(&container))
-    {
+    if client.list()?.iter().any(|c| c.id() == Some(&container)) {
         bail!(
             "container name {} is already in use without a matching jail record",
             container
         );
     }
-    if !backend
-        .command(&["volume", "inspect", &volume])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-    {
+    if !client.volume_exists(&volume) {
         // The label lets jail cleanup name the project after its state is gone.
-        backend.checked(&[
-            "volume".into(),
-            "create".into(),
-            "--label".into(),
-            format!("io.jail.project={}", project.root.display()),
-            volume.clone(),
-        ])?;
+        client.create_volume(
+            &volume,
+            &[(PROJECT_LABEL, project.root.display().to_string().as_str())],
+        )?;
     }
     let requested = if cfg.network.mode == NetworkMode::None {
         &[][..]
@@ -200,24 +169,14 @@ pub fn ensure(
     };
     let (ports, reservations) = allocate_ports(requested, cfg.network.auto_port)?;
     let guard = crate::write_guard::prepare(&project.root, cfg)?;
-    let mut args = vec![
-        "run".into(),
-        "--detach".into(),
-        "--name".into(),
-        container.clone(),
-        "--label".into(),
-        format!("io.jail.project={}", project.root.display()),
-        "--label".into(),
-        "io.jail.managed=true".into(),
-        "--cpus".into(),
-        cfg.resources.cpus.to_string(),
-        "--memory".into(),
-        cfg.resources.memory.clone(),
-        "--cap-drop".into(),
-        "ALL".into(),
-        "--tmpfs".into(),
-        "/run".into(),
-    ];
+    let mut run = Run::new(&container, &image);
+    run.detach()
+        .label(PROJECT_LABEL, &project.root.display().to_string())
+        .label("io.jail.managed", "true")
+        .cpus(cfg.resources.cpus)
+        .memory(&cfg.resources.memory)
+        .cap_drop("ALL")
+        .tmpfs("/run");
     // The trusted supervisor alone sets firewall and user identity. Agents drop
     // every capability and set no_new_privs before executing a CLI.
     for cap in [
@@ -231,49 +190,23 @@ pub fn ensure(
         "SYS_ADMIN",
         "KILL",
     ] {
-        args.extend(["--cap-add".into(), cap.into()]);
+        run.cap_add(cap);
     }
-    let root = project.root.to_string_lossy();
     let read_only = cfg.workspace.read_only || !cfg.tools.edit;
-    args.extend([
-        "--mount".into(),
-        format!(
-            "type=bind,source={root},target={root}{}",
-            if read_only { ",readonly" } else { "" }
-        ),
-        "--mount".into(),
-        format!("type=volume,source={volume},target=/home/jail"),
-        "--env".into(),
-        format!("JAIL_CONFIG_JSON={}", serde_json::to_string(cfg)?),
-        "--env".into(),
-        format!("JAIL_WRITE_GUARD={}", serde_json::to_string(&guard)?),
-    ]);
+    run.bind(&project.root, &project.root, read_only)
+        .volume(&volume, "/home/jail")
+        .env("JAIL_CONFIG_JSON", &serde_json::to_string(cfg)?)
+        .env("JAIL_WRITE_GUARD", &serde_json::to_string(&guard)?);
     for mount in &cfg.workspace.mounts {
-        args.extend([
-            "--mount".into(),
-            format!(
-                "type=bind,source={},target={}{}",
-                mount.source.display(),
-                mount.target.display(),
-                if mount.read_only || read_only {
-                    ",readonly"
-                } else {
-                    ""
-                }
-            ),
-        ]);
+        run.bind(&mount.source, &mount.target, mount.read_only || read_only);
     }
     for hidden in &cfg.workspace.hidden {
-        args.extend([
-            "--masked-path".into(),
-            project.root.join(hidden).to_string_lossy().into_owned(),
-        ]);
+        run.masked_path(&project.root.join(hidden));
     }
     for port in &ports {
-        args.extend(["--publish".into(), port.specification()]);
+        run.publish(&port.specification());
     }
     // No host home, SSH agent or runtime socket is shared. Ports bind loopback only.
-    args.push(image.clone());
     let record = Record {
         container,
         root: project.root.clone(),
@@ -285,10 +218,10 @@ pub fn ensure(
     // Save the record before creation so a failed startup is diagnosable.
     project.save(data, &record)?;
     drop(reservations); // Apple container now owns the binds, not jail.
-    backend
-        .checked(&args)
+    client
+        .run(&run)
         .context("container creation failed; check host port conflicts and container logs")?;
-    wait_ready(backend, &record)?;
+    wait_ready(client, &record)?;
     if cfg.network.mode == NetworkMode::None {
         eprintln!("jail: network is disabled; online model requests cannot run");
     }
@@ -333,19 +266,13 @@ fn check_restart_ports(ports: &[Port]) -> Result<()> {
     }
     Ok(())
 }
-fn wait_ready(backend: &Backend, record: &Record) -> Result<()> {
+fn wait_ready(client: &Client, record: &Record) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(30) {
-        let status = backend
-            .command(&[
-                "exec",
-                "--user",
-                "root",
-                &record.container,
-                "test",
-                "-f",
-                READY,
-            ])
+        let status = client
+            .exec(&record.container)
+            .user("root")
+            .command(&["test", "-f", READY])
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()?;
