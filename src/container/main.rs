@@ -167,21 +167,22 @@ fn protect_paths() -> Result<()> {
     struct Guard {
         anchors: Vec<PathBuf>,
         readonly: Vec<PathBuf>,
+        /// The workspace, set only when writes are limited to `writable`.
+        #[serde(default)]
+        root: Option<PathBuf>,
+        #[serde(default)]
+        writable: Vec<PathBuf>,
     }
-    let guard: Guard = serde_json::from_str(&std::env::var("JAIL_WRITE_GUARD")?)?;
-    for (path, readonly) in guard
-        .anchors
-        .iter()
-        .map(|p| (p, false))
-        .chain(guard.readonly.iter().map(|p| (p, true)))
-    {
+    /// Binds `path` onto itself; `recursive` keeps the mounts below it.
+    fn bind(path: &Path, recursive: bool) -> Result<()> {
         let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        let flags = libc::MS_BIND | if recursive { libc::MS_REC } else { 0 };
         if unsafe {
             libc::mount(
                 path.as_ptr(),
                 path.as_ptr(),
                 std::ptr::null(),
-                libc::MS_BIND,
+                flags,
                 std::ptr::null(),
             )
         } != 0
@@ -189,23 +190,51 @@ fn protect_paths() -> Result<()> {
             return Err(std::io::Error::last_os_error())
                 .context("cannot establish protected mount boundary");
         }
-        if readonly
-            && unsafe {
-                libc::mount(
-                    std::ptr::null(),
-                    path.as_ptr(),
-                    std::ptr::null(),
-                    libc::MS_BIND
-                        | libc::MS_REMOUNT
-                        | libc::MS_RDONLY
-                        | libc::MS_NOSUID
-                        | libc::MS_NODEV,
-                    std::ptr::null(),
-                )
-            } != 0
+        Ok(())
+    }
+    /// Makes the topmost mount at `path` read-only; mounts below it keep their flags.
+    fn remount_readonly(path: &Path) -> Result<()> {
+        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                path.as_ptr(),
+                std::ptr::null(),
+                libc::MS_BIND
+                    | libc::MS_REMOUNT
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV,
+                std::ptr::null(),
+            )
+        } != 0
         {
             return Err(std::io::Error::last_os_error())
                 .context("cannot enforce read-only protected path");
+        }
+        Ok(())
+    }
+    let guard: Guard = serde_json::from_str(&std::env::var("JAIL_WRITE_GUARD")?)?;
+    for anchor in &guard.anchors {
+        bind(anchor, false)?;
+    }
+    for path in &guard.readonly {
+        bind(path, false)?;
+        remount_readonly(path)?;
+    }
+    if let Some(root) = &guard.root {
+        // Each writable path becomes its own mount, and recursive binds copy
+        // the read-only mounts below it. Then the workspace mount, and every
+        // anchor outside a writable path, turns read-only above them.
+        for path in &guard.writable {
+            bind(path, true)?;
+        }
+        bind(root, true)?;
+        remount_readonly(root)?;
+        for anchor in &guard.anchors {
+            if !guard.writable.iter().any(|w| anchor.starts_with(w)) {
+                remount_readonly(anchor)?;
+            }
         }
     }
     // Root gateway does not need mount privileges after initialization.

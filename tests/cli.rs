@@ -533,6 +533,46 @@ fn edit_off_creates_read_only_mount_and_rejects_override() {
 }
 
 #[test]
+fn allow_write_sends_writable_paths_to_the_guest_and_conflicts_with_read_only() {
+    let f = Fixture::new();
+    let workspace = f.tmp.path().join("project with spaces");
+    fs::create_dir(workspace.join("src")).unwrap();
+    fs::write(
+        &f.config,
+        "[auth]\nimport_host=false\n[workspace]\nallow_write=['src/', 'out/']\n",
+    )
+    .unwrap();
+    succeeds(&f.run(&["claude", "-p", "edit src"]));
+    let calls = f.calls();
+    let run = calls.iter().find(|a| a[0] == "run").unwrap();
+    // The host shares the workspace writable; the guest makes the rest read-only.
+    assert!(run
+        .iter()
+        .any(|a| a.starts_with("type=bind,") && !a.ends_with(",readonly")));
+    let guard: Value = serde_json::from_str(
+        run.iter()
+            .find_map(|a| a.strip_prefix("JAIL_WRITE_GUARD="))
+            .unwrap(),
+    )
+    .unwrap();
+    let root = workspace.canonicalize().unwrap();
+    assert_eq!(guard["root"], root.to_str().unwrap());
+    assert_eq!(
+        guard["writable"],
+        serde_json::json!([root.join("out"), root.join("src")])
+    );
+    assert!(workspace.join("out").is_dir());
+    fs::write(
+        &f.config,
+        "[auth]\nimport_host=false\n[workspace]\nread_only=true\nallow_write=['src/']\n",
+    )
+    .unwrap();
+    let result = f.run(&["claude", "--version"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("allow_write"));
+}
+
+#[test]
 fn auto_stop_restarts_and_configuration_changes_require_explicit_recreate() {
     let f = Fixture::new();
     succeeds(&f.run(&["--auto-stop", "codex", "exec", "hello"]));

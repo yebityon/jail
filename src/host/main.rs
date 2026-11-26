@@ -239,6 +239,7 @@ fn run(mut cli: Cli) -> Result<i32> {
                 "auto_stop": cli.auto_stop || cfg.lifecycle.auto_stop,
                 "auth": if cfg.auth.import_host { "subscription login in root-only proxy; agent gets placeholders" } else { "explicit jail auth required; no API keys" },
                 "protect_sensitive": cfg.workspace.protect_sensitive, "deny_write": cfg.workspace.deny_write,
+                "allow_write": cfg.workspace.allow_write,
                 "environment_names": cfg.environment.pass.iter().chain(cfg.environment.set.keys()).collect::<Vec<_>>()
             }))?
         );

@@ -41,6 +41,8 @@ pub struct Workspace {
     pub hidden: Vec<String>,
     pub protect_sensitive: bool,
     pub deny_write: Vec<String>,
+    /// When set, the workspace is read-only except these project-relative paths.
+    pub allow_write: Vec<String>,
 }
 impl Default for Workspace {
     fn default() -> Self {
@@ -50,6 +52,7 @@ impl Default for Workspace {
             hidden: vec![],
             protect_sensitive: true,
             deny_write: vec![],
+            allow_write: vec![],
         }
     }
 }
@@ -256,6 +259,7 @@ impl Config {
             .hidden
             .iter()
             .chain(&self.workspace.deny_write)
+            .chain(&self.workspace.allow_write)
         {
             let path = Path::new(hidden);
             if hidden.is_empty()
@@ -264,8 +268,14 @@ impl Config {
                     .components()
                     .any(|p| !matches!(p, std::path::Component::Normal(_)))
             {
-                bail!("workspace.hidden/deny_write entries must be relative paths without ..");
+                bail!(
+                    "workspace.hidden/deny_write/allow_write entries must be relative paths without .."
+                );
             }
+        }
+        if !self.workspace.allow_write.is_empty() && (self.workspace.read_only || !self.tools.edit)
+        {
+            bail!("workspace.allow_write cannot be combined with workspace.read_only or tools.edit=false");
         }
         for key in self
             .environment
@@ -349,6 +359,22 @@ mod tests {
         assert!(c.validate().is_ok());
         c.workspace.hidden.push("../secret".into());
         assert!(c.validate().is_err());
+    }
+    #[test]
+    fn allow_write_paths_validate_and_conflict_with_read_only() {
+        let mut c = Config::default();
+        c.workspace.allow_write = vec!["src/".into(), "notes.md".into()];
+        assert!(c.validate().is_ok());
+        c.workspace.read_only = true;
+        assert!(c.validate().is_err());
+        c.workspace.read_only = false;
+        c.tools.edit = false;
+        assert!(c.validate().is_err());
+        c.tools.edit = true;
+        for path in ["../src", "/src", ".", ""] {
+            c.workspace.allow_write = vec![path.into()];
+            assert!(c.validate().is_err(), "{path}");
+        }
     }
     #[test]
     fn port_defaults_and_validation() {
