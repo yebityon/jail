@@ -107,7 +107,7 @@ jail --dry-run claude --resume
 | `jail recreate` | Remove the current container; the next launch creates a new one |
 | `jail cleanup` | List jail home volumes and images, with the containers using them |
 | `jail cleanup volume NAME…` / `jail cleanup image TAG…` | Delete the named home volumes / images if no container uses them |
-| `jail cleanup --all-delete` | Delete every jail home volume and image that no container uses |
+| `jail cleanup --all-delete` | Delete every jail container, home volume and image |
 
 Use `jail --help` or `jail <command> --help` for command-specific options.
 
@@ -135,7 +135,7 @@ jail claude  # or jail codex
 
 > `recreate` deletes the container's root filesystem, including packages and files added outside its persistent home or shared mounts. It preserves the project's home volume, CLI settings/history and host files. Host login is re-imported on the next authenticated launch.
 
-Home volumes and images are never deleted automatically. `jail cleanup` lists jail's home volumes and images, each with its project path where known, creation date and the containers using it. Deletion runs only for the names you pass, or for every unused one with `--all-delete`:
+Home volumes and images are never deleted automatically. `jail cleanup` lists jail's home volumes and images, each with its project path where known, creation date and the containers using it. Deletion runs only for the names you pass, or for all of them with `--all-delete`:
 
 ```sh
 jail cleanup
@@ -144,7 +144,7 @@ jail cleanup image jail-runtime:0123456789abcdef0123
 jail cleanup --all-delete
 ```
 
-`--all-delete` asks for no confirmation. It deletes jail's home volumes and images one by one by name, skips and reports those in use, and never touches volumes or images in other formats.
+`--all-delete` asks for no confirmation. It first stops and deletes every container jail has a record of, then deletes jail's home volumes and images one by one by name. It refuses to start while any jail session is active. It never touches containers jail has no record of, or volumes and images in other formats; if one of those containers uses a jail volume or image, the deletion stops with an error.
 
 Only names in jail's own formats (`jail-<16 hex>-home`, `jail-runtime:<20 hex>`) are accepted. A volume or image used by any container is refused; to free a project's home volume, close its sessions and run `jail recreate` in that project first. Deleting a home volume permanently removes that project's CLI settings and history; the next launch creates an empty one. A deleted image is rebuilt when a configuration needs it again. New home volumes carry their project path as a label, so the path remains visible after jail state is removed.
 

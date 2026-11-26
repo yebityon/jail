@@ -107,7 +107,7 @@ jail --dry-run claude --resume
 | `jail recreate` | 現在のコンテナを削除し、次回起動で新規作成 |
 | `jail cleanup` | jailのホームvolume・イメージと、それを使うコンテナを一覧表示 |
 | `jail cleanup volume NAME…` / `jail cleanup image TAG…` | 指定したホームvolume・イメージを、使うコンテナがなければ削除 |
-| `jail cleanup --all-delete` | コンテナが使っていないjailのホームvolume・イメージをすべて削除 |
+| `jail cleanup --all-delete` | jailのコンテナ・ホームvolume・イメージをすべて削除 |
 
 詳細なオプションは`jail --help`・`jail <command> --help`で確認できます。
 
@@ -135,7 +135,7 @@ jail claude  # または jail codex
 
 > `recreate`はコンテナのルートファイルシステムを削除します。永続ホームや共有マウントの外に追加したファイル・パッケージは失われます。ホームvolume・CLIの設定／履歴・ホストファイルは保持し、次の認証付き起動でホストログインを再取り込みします。
 
-ホームvolumeとイメージは自動では削除しません。`jail cleanup`は、jailのホームvolumeとイメージを一覧表示します。各項目には、分かる範囲でプロジェクトのパス、作成日、使用中のコンテナを示します。削除するのは、指定した名前か、`--all-delete`を付けた場合の未使用のものすべてです。
+ホームvolumeとイメージは自動では削除しません。`jail cleanup`は、jailのホームvolumeとイメージを一覧表示します。各項目には、分かる範囲でプロジェクトのパス、作成日、使用中のコンテナを示します。削除するのは、指定した名前か、`--all-delete`を付けた場合のすべてです。
 
 ```sh
 jail cleanup
@@ -144,7 +144,7 @@ jail cleanup image jail-runtime:0123456789abcdef0123
 jail cleanup --all-delete
 ```
 
-`--all-delete`は確認を求めません。jailのホームvolumeとイメージを名前で1件ずつ削除します。使用中のものは削除せずに表示し、jailの形式ではないvolume・イメージには触れません。
+`--all-delete`は確認を求めません。まず、jailが記録を持つコンテナをすべて停止・削除します。次に、jailのホームvolumeとイメージを名前で1件ずつ削除します。jailのセッションが1つでも使用中なら、何も削除せずに終了します。jailが記録を持たないコンテナと、jailの形式ではないvolume・イメージには触れません。そのようなコンテナがjailのvolume・イメージを使っている場合は、エラーで削除を止めます。
 
 受け付ける名前は、jail自身の形式（`jail-<16桁の16進数>-home`・`jail-runtime:<20桁の16進数>`）だけです。いずれかのコンテナが使っているvolume・イメージは削除しません。プロジェクトのホームvolumeを削除するには、先にそのセッションを閉じ、そのプロジェクトで`jail recreate`を実行してください。ホームvolumeを削除すると、そのプロジェクトのCLI設定と履歴は元に戻せません。次回起動では空のvolumeを作成します。削除したイメージは、設定が再び必要とした時点で再ビルドします。新しく作るホームvolumeにはプロジェクトのパスをラベルとして付けるため、jailの状態ファイルを削除した後もパスを表示できます。
 

@@ -1,6 +1,7 @@
 //! Explicit removal of jail-owned home volumes and images. Only names in jail's
 //! own formats are touched, one by one; resources still used by any container
-//! are refused, or skipped by --all-delete.
+//! are refused. --all-delete first deletes every container jail has a record
+//! of, so it removes all of them.
 use crate::{
     backend::{container_id, Backend},
     project::{self, volume_key, Project, Record},
@@ -117,7 +118,7 @@ pub fn run(
                 })?;
             }
             for name in &names {
-                remove_volume(backend, data, name, false)?;
+                remove_volume(backend, data, name)?;
             }
             Ok(0)
         }
@@ -131,16 +132,45 @@ pub fn run(
             }
             let _locks = image_locks(data)?;
             for tag in &tags {
-                remove_image(backend, data, tag, false)?;
+                remove_image(backend, data, tag)?;
             }
             Ok(0)
         }
     }
 }
 
-/// Deletes every jail-owned home volume and image that no container uses.
-/// Other volumes and images are never listed as candidates.
+/// Deletes every container jail has a record of, then every jail-owned home
+/// volume and image. Other containers, volumes and images are never listed as
+/// candidates, so one of them still using a jail resource stops the deletion.
 fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
+    let records = project::records(data)?;
+    // Refuse before deleting anything while any session is active.
+    let mut locks = vec![];
+    for record in &records {
+        let key = project::key(&record.root);
+        let lifecycle = project::lock(data, &key, "lifecycle")?;
+        FileExt::lock_exclusive(&lifecycle)?;
+        let sessions = project::lock(data, &key, "sessions")?;
+        FileExt::try_lock_exclusive(&sessions).with_context(|| {
+            format!(
+                "{} has active sessions; close them before --all-delete",
+                record.container
+            )
+        })?;
+        locks.push([lifecycle, sessions]);
+    }
+    let mut containers = 0;
+    for record in &records {
+        if backend.owned_state(record)?.is_some() {
+            backend.checked(&["stop", &record.container])?;
+            backend.checked(&["delete", &record.container])?;
+            println!("removed container {}", record.container);
+            containers += 1;
+        }
+        fs::remove_file(project::record_path(data, &project::key(&record.root)))?;
+    }
+    // remove_volume takes each project's lifecycle lock itself.
+    drop(locks);
     let volumes: Vec<String> = listed(backend, "volume")?
         .iter()
         .filter_map(volume_entry)
@@ -151,37 +181,26 @@ fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
         .filter_map(image_entry)
         .map(str::to_owned)
         .collect();
-    let (mut removed, mut skipped) = (0, 0);
     for name in &volumes {
-        if remove_volume(backend, data, name, true)? {
-            removed += 1;
-        } else {
-            skipped += 1;
-        }
+        remove_volume(backend, data, name)?;
     }
     let _locks = image_locks(data)?;
     for tag in &images {
-        if remove_image(backend, data, tag, true)? {
-            removed += 1;
-        } else {
-            skipped += 1;
-        }
+        remove_image(backend, data, tag)?;
     }
-    println!("removed {removed}, skipped {skipped} in use");
+    println!(
+        "removed {} in total",
+        containers + volumes.len() + images.len()
+    );
     Ok(0)
 }
 
-/// Returns false when `skip_used` is set and a container still uses the volume.
-fn remove_volume(backend: &Backend, data: &Path, name: &str, skip_used: bool) -> Result<bool> {
+fn remove_volume(backend: &Backend, data: &Path, name: &str) -> Result<()> {
     let key = volume_key(name).context("not a jail home volume")?;
     // Launch, stop and recreate of that project wait while this runs.
     let lifecycle = project::lock(data, key, "lifecycle")?;
     FileExt::lock_exclusive(&lifecycle)?;
     let users = users(&backend.list()?, &project::records(data)?, name);
-    if !users.is_empty() && skip_used {
-        println!("skipped home volume {name}: in use by {}", users.join(", "));
-        return Ok(false);
-    }
     if !users.is_empty() {
         bail!(
             "{name} is used by container {}; close its sessions and run jail recreate in that project first",
@@ -193,17 +212,12 @@ fn remove_volume(backend: &Backend, data: &Path, name: &str, skip_used: bool) ->
     }
     backend.checked(&["volume", "delete", name])?;
     println!("removed home volume {name}");
-    Ok(true)
+    Ok(())
 }
 
-/// Returns false when `skip_used` is set and a container still uses the image.
 /// The caller holds `image_locks`.
-fn remove_image(backend: &Backend, data: &Path, tag: &str, skip_used: bool) -> Result<bool> {
+fn remove_image(backend: &Backend, data: &Path, tag: &str) -> Result<()> {
     let users = users(&backend.list()?, &project::records(data)?, tag);
-    if !users.is_empty() && skip_used {
-        println!("skipped image {tag}: in use by {}", users.join(", "));
-        return Ok(false);
-    }
     if !users.is_empty() {
         bail!(
             "{tag} is used by container {}; recreate those projects first",
@@ -219,7 +233,7 @@ fn remove_image(backend: &Backend, data: &Path, tag: &str, skip_used: bool) -> R
         fs::remove_dir_all(&context)?;
     }
     println!("removed image {tag}");
-    Ok(true)
+    Ok(())
 }
 
 fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Result<i32> {
@@ -290,7 +304,7 @@ fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Res
         println!("  none");
     }
     println!("Delete explicitly: jail cleanup volume <name>... / jail cleanup image <tag>...");
-    println!("Delete every unused one: jail cleanup --all-delete");
+    println!("Delete all of them and every jail container: jail cleanup --all-delete");
     Ok(0)
 }
 

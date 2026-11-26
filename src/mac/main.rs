@@ -64,13 +64,13 @@ enum Action {
     #[command(about = "Explicitly re-import this tool's host login (claude or codex)")]
     Auth { tool: String },
     #[command(
-        about = "List jail home volumes and images; delete named ones, or all with --all-delete, if no container uses them",
+        about = "List jail home volumes and images; delete named ones if no container uses them, or all with --all-delete",
         args_conflicts_with_subcommands = true
     )]
     Cleanup {
         #[arg(
             long,
-            help = "Delete every jail home volume and image that no container uses, without confirmation"
+            help = "Delete every jail container, home volume and image, without confirmation"
         )]
         all_delete: bool,
         #[command(subcommand)]

@@ -306,11 +306,10 @@ fn cleanup_removes_only_named_unused_jail_volumes_and_images() {
 }
 
 #[test]
-fn all_delete_removes_every_unused_jail_resource_and_nothing_else() {
+fn all_delete_removes_every_jail_container_volume_and_image_and_nothing_else() {
     let f = Fixture::new();
     let plan: Value =
         serde_json::from_slice(&f.run(&["--dry-run", "codex", "--version"]).stdout).unwrap();
-    let used_volume = plan["home_volume"].as_str().unwrap().to_owned();
     let used_image = plan["image"].as_str().unwrap().to_owned();
     let items = |kind: &str| -> Value {
         serde_json::from_slice(&fs::read(f.tmp.path().join(format!("{kind}s.json"))).unwrap())
@@ -347,33 +346,46 @@ fn all_delete_removes_every_unused_jail_resource_and_nothing_else() {
     }
     assert_eq!(items("volume").as_object().unwrap().len(), 4);
 
+    // An active session refuses the deletion before anything is removed.
+    let mut session = f
+        .command(&["codex", "exec", "long session"])
+        .env("JAIL_TEST_SLEEP", "2")
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !f
+        .calls()
+        .iter()
+        .any(|a| a.iter().any(|s| s == "long session"))
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let out = f.run(&["cleanup", "--all-delete"]);
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("active sessions"));
+    assert!(session.wait().unwrap().success());
+    assert!(!f
+        .calls()
+        .iter()
+        .any(|a| a[0] == "delete" || a.get(1).is_some_and(|s| s == "delete")));
+    assert_eq!(items("volume").as_object().unwrap().len(), 4);
+
+    // The container in use is deleted first, so nothing is skipped.
+    let container = f.record()["id"].as_str().unwrap().to_owned();
     let out = f.run(&["cleanup", "--all-delete"]);
     succeeds(&out);
     let stdout = String::from_utf8(out.stdout).unwrap();
-    assert!(stdout.contains(&format!("skipped home volume {used_volume}")));
-    assert!(stdout.contains(&format!("skipped image {used_image}")));
-    assert!(stdout.contains("removed 4, skipped 2 in use"));
-    let volumes: Vec<_> = items("volume")
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    assert_eq!(volumes, vec![used_volume.clone(), "my-data".to_owned()]);
-    let images: Vec<_> = items("image")
-        .as_object()
-        .unwrap()
-        .keys()
-        .cloned()
-        .collect();
-    assert_eq!(
-        images,
-        vec!["docker.io/library/node:22".to_owned(), used_image.clone()]
-    );
-
-    // Once the container is gone, its volume and image are removed as well.
-    succeeds(&f.run(&["recreate"]));
-    succeeds(&f.run(&["cleanup", "--all-delete"]));
+    assert!(stdout.contains(&format!("removed container {container}")));
+    assert!(stdout.contains("removed 7 in total"));
+    assert!(!stdout.contains("skipped"));
+    let containers: Value =
+        serde_json::from_slice(&fs::read(f.tmp.path().join("containers.json")).unwrap()).unwrap();
+    assert_eq!(containers, serde_json::json!([]));
+    let projects = f.tmp.path().join("state/projects");
+    for project in fs::read_dir(projects).unwrap() {
+        assert!(!project.unwrap().path().join("record.json").exists());
+    }
     assert_eq!(
         items("volume")
             .as_object()

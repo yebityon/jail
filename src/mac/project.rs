@@ -127,7 +127,7 @@ impl Project {
         ))
     }
     pub fn record_path(&self, data: &Path) -> PathBuf {
-        dir(data, &self.key).join("record.json")
+        record_path(data, &self.key)
     }
     pub fn record(&self, data: &Path) -> Result<Option<Record>> {
         read_record(&self.record_path(data))
@@ -174,11 +174,16 @@ fn projects(data: &Path) -> PathBuf {
 pub fn dir(data: &Path, key: &str) -> PathBuf {
     projects(data).join(key)
 }
+pub fn record_path(data: &Path, key: &str) -> PathBuf {
+    dir(data, key).join("record.json")
+}
 /// Opens one project's lock file; callers lock it shared or exclusively.
 /// - `lifecycle`: held exclusively while launch, stop, recreate, a policy
-///   change or home volume deletion changes that project's container.
-/// - `sessions`: each running session holds it shared; stop, recreate and
-///   auto-stop take it exclusively to prove that no session is active.
+///   change, cleanup --all-delete or home volume deletion changes that
+///   project's container.
+/// - `sessions`: each running session holds it shared; stop, recreate,
+///   auto-stop and cleanup --all-delete take it exclusively to prove that no
+///   session is active.
 /// - `auth-<tool>`: held by the one session that follows host login
 ///   refreshes; others only try it, never wait.
 ///
