@@ -35,7 +35,7 @@ fn users(containers: &[Container], records: &[Record], name: &str) -> Vec<String
         let id = entry.id().unwrap_or("unnamed container");
         let recorded = records
             .iter()
-            .any(|r| r.container == id && (r.volume == name || r.image == name));
+            .any(|r| r.container == id && (r.volume.as_deref() == Some(name) || r.image == name));
         if recorded || entry.mentions(name) {
             out.push(id.to_owned());
         }
@@ -224,7 +224,7 @@ fn list(client: &Client, data: &Path, project: &Project, current: &str) -> Resul
         // Volumes created before labels were added identify only this project.
         let root = records
             .iter()
-            .find(|r| r.volume == name)
+            .find(|r| r.volume.as_deref() == Some(name))
             .map(|r| r.root.display().to_string())
             .or_else(|| entry.label(PROJECT_LABEL).map(str::to_owned))
             .or_else(|| (key == project.key).then(|| project.root.display().to_string()))

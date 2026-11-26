@@ -17,6 +17,8 @@ pub struct Project {
     pub root: PathBuf,
     pub cwd: PathBuf,
     pub key: String,
+    /// A throwaway project with no host directory, deleted when its session ends.
+    pub ephemeral: bool,
 }
 /// jail's record of a project's container, saved as `record.json`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -27,7 +29,9 @@ pub struct Record {
     pub root: PathBuf,
     pub spec: String,
     pub image: String,
-    pub volume: String,
+    /// Home volume; an ephemeral container has none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub volume: Option<String>,
     #[serde(default)]
     pub ports: Vec<Port>,
 }
@@ -85,6 +89,27 @@ fn directory_slug(root: &Path) -> String {
         slug.into()
     }
 }
+/// Parent of ephemeral projects' roots, which never exist on the host.
+const EPHEMERAL_ROOT: &str = "/ephemeral";
+/// `jail-<slug>-` followed by the local creation time, down to microseconds.
+fn timestamped(slug: &str) -> Result<String> {
+    let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
+    let seconds = now.as_secs() as libc::time_t;
+    let mut date: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&seconds, &mut date) }.is_null() {
+        bail!("cannot format container creation time");
+    }
+    Ok(format!(
+        "jail-{slug}-{:04}{:02}{:02}-{:02}{:02}{:02}-{:06}",
+        date.tm_year + 1900,
+        date.tm_mon + 1,
+        date.tm_mday,
+        date.tm_hour,
+        date.tm_min,
+        date.tm_sec,
+        now.subsec_micros()
+    ))
+}
 impl Project {
     pub fn discover() -> Result<Self> {
         let cwd = std::env::current_dir()?.canonicalize()?;
@@ -105,26 +130,34 @@ impl Project {
         // The visible container name is independent of the key and stored in
         // Record.container.
         let key = key(&root);
-        Ok(Self { root, cwd, key })
+        Ok(Self {
+            root,
+            cwd,
+            key,
+            ephemeral: false,
+        })
+    }
+    /// A project that shares no host directory. Its root only names the
+    /// container's record and locks; nothing is mounted from it.
+    pub fn ephemeral() -> Result<Self> {
+        let root = Path::new(EPHEMERAL_ROOT).join(timestamped("ephemeral")?);
+        Ok(Self {
+            key: key(&root),
+            cwd: "/home/jail".into(),
+            root,
+            ephemeral: true,
+        })
     }
     pub fn new_container_name(&self) -> Result<String> {
-        let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-        let seconds = now.as_secs() as libc::time_t;
-        let mut date: libc::tm = unsafe { std::mem::zeroed() };
-        if unsafe { libc::localtime_r(&seconds, &mut date) }.is_null() {
-            bail!("cannot format container creation time");
+        if self.ephemeral {
+            // The name was chosen with the root, which must stay unique.
+            let name = self
+                .root
+                .file_name()
+                .context("ephemeral root has no name")?;
+            return Ok(name.to_string_lossy().into_owned());
         }
-        Ok(format!(
-            "jail-{}-{:04}{:02}{:02}-{:02}{:02}{:02}-{:06}",
-            directory_slug(&self.root),
-            date.tm_year + 1900,
-            date.tm_mon + 1,
-            date.tm_mday,
-            date.tm_hour,
-            date.tm_min,
-            date.tm_sec,
-            now.subsec_micros()
-        ))
+        timestamped(&directory_slug(&self.root))
     }
     pub fn record_path(&self, data: &Path) -> PathBuf {
         record_path(data, &self.key)
@@ -239,6 +272,7 @@ mod tests {
             key: key(&root),
             cwd: root.clone(),
             root,
+            ephemeral: false,
         };
         let name = project.new_container_name().unwrap();
         assert!(name.starts_with("jail-my-project-01-"));
@@ -254,5 +288,17 @@ mod tests {
         )
         .unwrap();
         assert!(record.ports.is_empty());
+        assert_eq!(record.volume.as_deref(), Some("v"));
+    }
+    #[test]
+    fn ephemeral_projects_are_unique_and_share_no_host_path() {
+        let a = Project::ephemeral().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let b = Project::ephemeral().unwrap();
+        assert_ne!(a.key, b.key);
+        let name = a.new_container_name().unwrap();
+        assert!(name.starts_with("jail-ephemeral-") && name.len() <= 63);
+        assert_eq!(a.root, Path::new(EPHEMERAL_ROOT).join(&name));
+        assert_eq!(a.cwd, Path::new("/home/jail"));
     }
 }

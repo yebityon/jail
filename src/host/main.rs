@@ -37,6 +37,11 @@ struct Cli {
         help = "Show launch plan without starting containers or reading credentials"
     )]
     dry_run: bool,
+    #[arg(
+        long,
+        help = "Run in a new container that mounts no host directory or home volume and is deleted on exit"
+    )]
+    ephemeral: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
@@ -144,6 +149,9 @@ fn run(mut cli: Cli) -> Result<i32> {
         println!();
         return Ok(0);
     };
+    if cli.ephemeral && !matches!(action, Action::Tool(_)) {
+        bail!("--ephemeral is supported for claude and codex");
+    }
     let path = config_path(&cli, &action)?;
     if let Action::Config {
         action: ConfigAction::Init,
@@ -173,7 +181,11 @@ fn run(mut cli: Cli) -> Result<i32> {
     }
     let client = backend::client();
     let data = data_path()?;
-    let project = project::Project::discover()?;
+    let project = if cli.ephemeral {
+        project::Project::ephemeral()?
+    } else {
+        project::Project::discover()?
+    };
     if let Action::Policy { action } = action {
         return policy_cli::run(action, &path, &cfg, &client, &data, &project);
     }
@@ -231,12 +243,13 @@ fn run(mut cli: Cli) -> Result<i32> {
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
                 "container": project.record(&data)?.map(|r| r.container).unwrap_or(project.new_container_name()?),
-                "project_key": project.key, "home_volume": project::home_volume(&project.key),
+                "project_key": project.key, "ephemeral": project.ephemeral,
+                "home_volume": (!project.ephemeral).then(|| project::home_volume(&project.key)),
                 "container_name_note": "new names include local creation time; dry-run name is a preview",
-                "image": image, "workspace": project.root,
+                "image": image, "workspace": (!project.ephemeral).then_some(&project.root),
                 "cwd": project.cwd, "read_only": cfg.workspace.read_only || !cfg.tools.edit,
                 "network": cfg.network, "resources": cfg.resources, "tool": tool, "arguments": args,
-                "auto_stop": cli.auto_stop || cfg.lifecycle.auto_stop,
+                "auto_stop": !project.ephemeral && (cli.auto_stop || cfg.lifecycle.auto_stop),
                 "auth": if cfg.auth.import_host { "subscription login in root-only proxy; agent gets placeholders" } else { "explicit jail auth required; no API keys" },
                 "protect_sensitive": cfg.workspace.protect_sensitive, "deny_write": cfg.workspace.deny_write,
                 "allow_write": cfg.workspace.allow_write,
@@ -282,7 +295,8 @@ fn run(mut cli: Cli) -> Result<i32> {
                 fs::remove_file(project.record_path(&data))?;
                 println!(
                     "removed {} root filesystem; home volume {} is preserved",
-                    record.container, record.volume
+                    record.container,
+                    record.volume.unwrap_or_default()
                 );
             }
             return Ok(0);
@@ -293,6 +307,12 @@ fn run(mut cli: Cli) -> Result<i32> {
         _ => {}
     }
     backend::ensure_service(&client)?;
+    // Declared before the locks, so it runs after they are released.
+    let _discard = project.ephemeral.then(|| Discard {
+        client: &client,
+        data: &data,
+        project: &project,
+    });
     let lifecycle = project::lock(&data, &project.key, "lifecycle")?;
     FileExt::lock_exclusive(&lifecycle)?;
     let sessions = project::lock(&data, &project.key, "sessions")?;
@@ -332,10 +352,11 @@ fn run(mut cli: Cli) -> Result<i32> {
     let mut args = vec![GUEST.to_owned(), "launch".into(), tool.clone()];
     args.extend(agent_args);
     let mut command = exec.command(&args);
-    let auto_stop = cli.auto_stop || cfg.lifecycle.auto_stop;
+    // An ephemeral container is deleted instead.
+    let auto_stop = !project.ephemeral && (cli.auto_stop || cfg.lifecycle.auto_stop);
     let session = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         Session::Pty
-    } else if auto_stop || host_login {
+    } else if auto_stop || host_login || project.ephemeral {
         Session::Wait
     } else {
         Session::Exec
@@ -377,6 +398,22 @@ fn run(mut cli: Cli) -> Result<i32> {
         eprintln!("jail: keeping container running for another active session");
     }
     result
+}
+
+/// Deletes an ephemeral session's container when the launch ends, however it ends.
+struct Discard<'a> {
+    client: &'a apple_container::Client,
+    data: &'a std::path::Path,
+    project: &'a project::Project,
+}
+impl Drop for Discard<'_> {
+    fn drop(&mut self) {
+        if let Err(e) = runtime::discard(self.client, self.data, self.project) {
+            eprintln!(
+                "jail: could not delete ephemeral container; run jail cleanup --all-delete: {e:#}"
+            );
+        }
+    }
 }
 
 fn wait_with_signals(command: &mut Command) -> Result<i32> {

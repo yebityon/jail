@@ -655,6 +655,50 @@ fn dry_run_never_contacts_backend_or_imports_credentials() {
 }
 
 #[test]
+fn ephemeral_session_mounts_nothing_and_is_deleted_on_exit() {
+    let f = Fixture::new();
+    fs::write(
+        &f.config,
+        "[auth]\nimport_host=false\n[network]\npublished_ports=[]\n[workspace]\nhidden=['.env']\nmounts=[{source='.',target='/extra/config'}]\n",
+    )
+    .unwrap();
+    let out = f.run(&["--dry-run", "--ephemeral", "claude"]);
+    succeeds(&out);
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(plan["container"]
+        .as_str()
+        .unwrap()
+        .starts_with("jail-ephemeral-"));
+    assert!(plan["workspace"].is_null() && plan["home_volume"].is_null());
+    assert_eq!(plan["cwd"], "/home/jail");
+    let out = f
+        .command(&["--ephemeral", "codex", "exec", "hi"])
+        .env("JAIL_TEST_EXIT", "7")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    let calls = f.calls();
+    let run = calls.iter().find(|a| a[0] == "run").unwrap();
+    assert!(!run.iter().any(|a| a == "--mount" || a == "--masked-path"));
+    assert!(run.iter().any(|a| a == "io.jail.ephemeral=true"));
+    assert!(!calls.iter().any(|a| a[0] == "volume"));
+    let exec = calls
+        .iter()
+        .find(|a| a[0] == "exec" && a.iter().any(|s| s == "launch"))
+        .unwrap();
+    assert!(exec.windows(2).any(|w| w == ["--workdir", "/home/jail"]));
+    // The container and its jail state are gone; the next launch is fresh.
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.tmp.path().join("containers.json")).unwrap()).unwrap();
+    assert_eq!(state, serde_json::json!([]));
+    let projects = f.tmp.path().join("state/projects");
+    assert_eq!(fs::read_dir(projects).unwrap().count(), 0);
+    for args in [vec!["--ephemeral", "stop"], vec!["--ephemeral", "recreate"]] {
+        assert!(!f.run(&args).status.success(), "{args:?}");
+    }
+}
+
+#[test]
 fn occupied_host_port_is_remapped_and_reported_but_not_silently_changed_on_restart() {
     use std::net::TcpListener;
     let f = Fixture::new();
