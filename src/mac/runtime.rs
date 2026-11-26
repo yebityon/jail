@@ -16,17 +16,32 @@ use std::{
 };
 
 const FILES: &[(&str, &str)] = &[
-    ("Cargo.toml", include_str!("../Cargo.toml")),
-    ("Cargo.lock", include_str!("../Cargo.lock")),
-    ("src/main.rs", "fn main() {}\n"),
-    ("src/lib.rs", include_str!("lib.rs")),
-    ("src/config.rs", include_str!("config.rs")),
-    ("src/agent_policy.rs", include_str!("agent_policy.rs")),
-    ("src/proxy.rs", include_str!("proxy.rs")),
-    ("src/network_policy.rs", include_str!("network_policy.rs")),
-    ("src/gateway.rs", include_str!("gateway.rs")),
-    ("src/bin/jail-guest.rs", include_str!("bin/jail-guest.rs")),
-    ("Dockerfile", include_str!("../container/Dockerfile")),
+    ("Cargo.toml", include_str!("../../Cargo.toml")),
+    ("Cargo.lock", include_str!("../../Cargo.lock")),
+    ("src/mac/main.rs", "fn main() {}\n"),
+    ("src/shared/lib.rs", include_str!("../shared/lib.rs")),
+    ("src/shared/config.rs", include_str!("../shared/config.rs")),
+    (
+        "src/shared/agent_policy.rs",
+        include_str!("../shared/agent_policy.rs"),
+    ),
+    (
+        "src/container/proxy.rs",
+        include_str!("../container/proxy.rs"),
+    ),
+    (
+        "src/container/network_policy.rs",
+        include_str!("../container/network_policy.rs"),
+    ),
+    (
+        "src/container/gateway.rs",
+        include_str!("../container/gateway.rs"),
+    ),
+    (
+        "src/container/main.rs",
+        include_str!("../container/main.rs"),
+    ),
+    ("Dockerfile", include_str!("../../container/Dockerfile")),
 ];
 const IMAGE_PREFIX: &str = "jail-runtime:";
 /// Hex digits of an image tag.
@@ -79,7 +94,7 @@ pub fn build(backend: &Backend, data: &Path, cfg: &Config, force: bool) -> Resul
         fs::create_dir_all(destination.parent().unwrap())?;
         fs::write(destination, content)?;
     }
-    fs::write(context.join("Cargo.lock"), include_str!("../Cargo.lock"))?;
+    fs::write(context.join("Cargo.lock"), include_str!("../../Cargo.lock"))?;
     // This build context contains source and version pins only, never a workspace or credentials.
     eprintln!("jail: building CLI image (first launch can take several minutes)");
     let mut args = vec![

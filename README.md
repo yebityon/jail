@@ -24,7 +24,6 @@ jail codex
 - **Private host login reuse** — subscription OAuth stays in a root-only gateway; agents see placeholders. No API keys or copied host settings.
 - **Sensitive write protection** — protect Git configuration/hooks and agent configuration while keeping source files editable.
 - **Adjustable network policy** — inspect denied destinations and approve allowlist changes without a restart.
-- **Live monitoring** — CPU, memory, process trees, and port mappings in a dashboard that redraws in place.
 - **Local development** — TCP forwarding to your Mac's IPv4 loopback interface, with automatic host-port allocation on conflicts.
 - **Configurable boundaries** — read-only mounts, hidden paths, network restrictions, resource limits, and native CLI tool policies.
 
@@ -58,7 +57,6 @@ Install Apple `container`, then install `jail` from the root of this source chec
 ```sh
 brew install container
 cargo install --path . --bin jail --locked
-jail doctor
 ```
 
 Ensure Cargo's bin directory, usually `~/.cargo/bin`, is on your `PATH`.
@@ -100,45 +98,18 @@ jail --dry-run claude --resume
 | Command | Purpose |
 | --- | --- |
 | `jail claude [args…]` / `jail codex [args…]` | Launch the native CLI inside the project's container |
-| `jail shell` | Open a shell, if allowed by policy |
-| `jail --tail` / `jail tail` | Show the current project's live dashboard |
-| `jail --tail --all` / `jail tail --all` | Monitor all projects managed by jail |
-| `jail status [--all]` | Show state, port mappings, CPU, and memory |
-| `jail status --watch` | Stream Apple's resource display |
-| `jail status --json` | Return state, port mappings, and statistics as JSON |
-| `jail ps` | Show processes, including command arguments |
 | `jail stop [--all]` | Stop managed containers that have no active jail sessions |
 | `jail stop --force` | Explicitly stop the current container even with active sessions |
 | `jail auth claude` / `jail auth codex` | Explicitly re-import the tool's host login |
 | `jail policy show` / `jail policy log [--json]` | Inspect configured policy / denied proxy destinations |
 | `jail policy allow HOST [--port 443]` / `jail policy reload` | Edit trusted allowlist / apply changes live |
 | `jail config show` | Print the resolved configuration |
-| `jail update` | Rebuild the configured image |
 | `jail recreate` | Remove the current container; the next launch creates a new one |
 | `jail cleanup` | List jail home volumes and images, with the containers using them |
 | `jail cleanup volume NAME…` / `jail cleanup image TAG…` | Delete the named home volumes / images if no container uses them |
-| `jail cleanup --all-delete` | Delete every jail home volume and image that no container uses |
-| `jail doctor` | Check the host and container service |
+| `jail cleanup --all-delete` | Delete every jail container, home volume and image |
 
 Use `jail --help` or `jail <command> --help` for command-specific options.
-
-### Live dashboard
-
-Run the dashboard in a separate terminal:
-
-```sh
-jail --tail
-jail --tail --all
-```
-
-The display redraws in place approximately once per second. It shows CPU usage, memory usage and limits, a memory bar, process relationships, elapsed process time, and saved port mappings.
-
-- CPU usage uses **100% per core**. The first sample displays `--`.
-- Apple's JSON statistics command samples over roughly two seconds. The screen updates independently; `sample …s ago` shows the age of the data.
-- Ctrl+C exits monitoring and restores the terminal. It does not stop containers or agent sessions.
-- Redirected output and `TERM=dumb` produce one plain-text snapshot, without terminal escape sequences.
-
-The dashboard displays executable names, not arguments, prompts, or environment variables. Short-lived processes may be missed. It is not an agent reasoning display or an audit log; operation history is on the [roadmap](TODO.md). Unlike the dashboard, `jail ps` includes command arguments, so redact its output before sharing.
 
 ### Container lifecycle
 
@@ -162,9 +133,9 @@ jail recreate
 jail claude  # or jail codex
 ```
 
-> `recreate` deletes the container's root filesystem, including packages and files added outside its persistent home or shared mounts. It preserves the project's home volume, CLI settings/history and host files. Host login is re-imported on the next authenticated launch. `jail update` alone does not replace an existing container.
+> `recreate` deletes the container's root filesystem, including packages and files added outside its persistent home or shared mounts. It preserves the project's home volume, CLI settings/history and host files. Host login is re-imported on the next authenticated launch.
 
-Home volumes and images are never deleted automatically. `jail cleanup` lists jail's home volumes and images, each with its project path where known, creation date and the containers using it. Deletion runs only for the names you pass, or for every unused one with `--all-delete`:
+Home volumes and images are never deleted automatically. `jail cleanup` lists jail's home volumes and images, each with its project path where known, creation date and the containers using it. Deletion runs only for the names you pass, or for all of them with `--all-delete`:
 
 ```sh
 jail cleanup
@@ -173,7 +144,7 @@ jail cleanup image jail-runtime:0123456789abcdef0123
 jail cleanup --all-delete
 ```
 
-`--all-delete` asks for no confirmation. It deletes jail's home volumes and images one by one by name, skips and reports those in use, and never touches volumes or images in other formats.
+`--all-delete` asks for no confirmation. It first stops and deletes every container jail has a record of, then deletes jail's home volumes and images one by one by name. It refuses to start while any jail session is active. It never touches containers jail has no record of, or volumes and images in other formats; if one of those containers uses a jail volume or image, the deletion stops with an error.
 
 Only names in jail's own formats (`jail-<16 hex>-home`, `jail-runtime:<20 hex>`) are accepted. A volume or image used by any container is refused; to free a project's home volume, close its sessions and run `jail recreate` in that project first. Deleting a home volume permanently removes that project's CLI settings and history; the next launch creates an empty one. A deleted image is rebuilt when a configuration needs it again. New home volumes carry their project path as a label, so the path remains visible after jail state is removed.
 
@@ -181,21 +152,20 @@ Only names in jail's own formats (`jail-<16 hex>-home`, `jail-runtime:<20 hex>`)
 
 By default, jail forwards container TCP ports **3000, 5173, 8000, and 8080** to your Mac's `127.0.0.1`. Port forwarding does **not** start a server.
 
-The server must listen on `0.0.0.0`, not only on the container's `127.0.0.1`. For example, inside `jail shell`:
+The server must listen on `0.0.0.0`, not only on the container's `127.0.0.1`. For example, an agent can start one with:
 
 ```sh
 node -e 'require("http").createServer((req, res) => res.end("hello from jail\n")).listen(8080, "0.0.0.0")'
 ```
 
-In another Mac terminal, check the assigned host port before connecting:
+Check the assigned host port in jail's launch output before connecting:
 
 ```sh
-jail status
-# If status shows host 8080 -> container 8080:
+# If launch output shows "jail: http://127.0.0.1:8080 -> container:8080 (TCP)":
 curl --noproxy '*' http://127.0.0.1:8080
 ```
 
-If the same host port is occupied during creation, jail allocates a different available port. Launch output, `status`, and `--tail` show the mapping. The `ports` array in `status --json` exposes the `host` and `container` values. Displayed HTTP URLs are conveniences for web development; the transport itself is TCP.
+If the same host port is occupied during creation, jail allocates a different available port. Launch output shows the mapping. Displayed HTTP URLs are conveniences for web development; the transport itself is TCP.
 
 ```toml
 [network]
@@ -387,7 +357,7 @@ Other current limitations:
 
 ### A forwarded port resets or refuses the connection
 
-A published port is not proof that an application is listening. Start with `jail status` and `jail ps`, then check:
+A published port is not proof that an application is listening. Check the following:
 
 1. The container is running and the server has started successfully.
 2. The server listens on `0.0.0.0` and the expected container port.
@@ -395,7 +365,7 @@ A published port is not proof that an application is listening. Start with `jail
 4. You are connecting to `127.0.0.1`, not an IPv6 `localhost` resolution, and bypassing any local proxy when testing.
 5. The network mode is not `none`, and the container was recreated after port configuration changed.
 
-If permitted, use `jail shell` to test the application from inside the container. A reset alone does not identify the cause; inspect the server's output before changing settings.
+A reset alone does not identify the cause; inspect the server's output before changing settings.
 
 ### Configuration or image changed
 
@@ -434,9 +404,9 @@ Optional real-container checks, after building the release binary:
 python3 scripts/protocol-smoke-test.py
 ```
 
-The container scripts create and clean up dedicated temporary containers and home volumes. The smoke test checks restrictions, protected-path replacement, denial logging/live reload, forwarding, monitoring and Codex sandbox behavior without host auth. The auth test imports host subscription login into root-only tmpfs and checks CLI recognition, credential visibility and a read-only model-catalog request. Neither performs inference or changes existing project containers. The protocol test uses only synthetic credentials and a local fake SSE server, with external network access blocked by macOS sandbox.
+The container scripts create and clean up dedicated temporary containers and home volumes. The smoke test checks restrictions, protected-path replacement, denial logging/live reload, forwarding and Codex sandbox behavior without host auth. The auth test imports host subscription login into root-only tmpfs and checks CLI recognition, credential visibility and a read-only model-catalog request. Neither performs inference or changes existing project containers. The protocol test uses only synthetic credentials and a local fake SSE server, with external network access blocked by macOS sandbox.
 
-The host entry point is [src/main.rs](src/main.rs); runtime management is in [src/runtime.rs](src/runtime.rs). The Linux supervisor is [src/bin/jail-guest.rs](src/bin/jail-guest.rs), and the live dashboard is [src/monitor.rs](src/monitor.rs).
+The host entry point is [src/main.rs](src/main.rs); runtime management is in [src/runtime.rs](src/runtime.rs). The Linux supervisor is [src/bin/jail-guest.rs](src/bin/jail-guest.rs).
 
 `JAIL_HOME` overrides the host state/build directory, normally `~/.local/share/jail`. `JAIL_CONTAINER_BIN` selects a backend executable for testing. For contributions, add tests for changed behavior and keep the English and Japanese READMEs aligned. Planned work is tracked in [TODO.md](TODO.md).
 

@@ -1,7 +1,10 @@
 pub mod agent_policy;
 pub mod config;
+#[path = "../container/gateway.rs"]
 pub mod gateway;
+#[path = "../container/network_policy.rs"]
 pub mod network_policy;
+#[path = "../container/proxy.rs"]
 pub mod proxy;
 
 use sha2::{Digest, Sha256};
