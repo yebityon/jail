@@ -406,7 +406,7 @@ python3 scripts/protocol-smoke-test.py
 
 The container scripts create and clean up dedicated temporary containers and home volumes. The smoke test checks restrictions, protected-path replacement, denial logging/live reload, forwarding and Codex sandbox behavior without host auth. The auth test imports host subscription login into root-only tmpfs and checks CLI recognition, credential visibility and a read-only model-catalog request. Neither performs inference or changes existing project containers. The protocol test uses only synthetic credentials and a local fake SSE server, with external network access blocked by macOS sandbox.
 
-The host entry point is [src/main.rs](src/main.rs); runtime management is in [src/runtime.rs](src/runtime.rs). The Linux supervisor is [src/bin/jail-guest.rs](src/bin/jail-guest.rs).
+The host entry point is [src/host/main.rs](src/host/main.rs); runtime management is in [src/host/runtime.rs](src/host/runtime.rs). Every call to Apple's `container` command goes through [src/host/apple_container](src/host/apple_container). The Linux supervisor is [src/container/main.rs](src/container/main.rs), and code both sides use is in [src/shared](src/shared).
 
 `JAIL_HOME` overrides the host state/build directory, normally `~/.local/share/jail`. `JAIL_CONTAINER_BIN` selects a backend executable for testing. For contributions, add tests for changed behavior and keep the English and Japanese READMEs aligned. Planned work is tracked in [TODO.md](TODO.md).
 

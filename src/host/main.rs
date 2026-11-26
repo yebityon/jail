@@ -1,3 +1,4 @@
+mod apple_container;
 mod auth;
 mod backend;
 mod cleanup;
@@ -170,11 +171,11 @@ fn run(mut cli: Cli) -> Result<i32> {
         print!("{}", toml::to_string_pretty(&cfg)?);
         return Ok(0);
     }
-    let backend = backend::Backend::new();
+    let client = backend::client();
     let data = data_path()?;
     let project = project::Project::discover()?;
     if let Action::Policy { action } = action {
-        return policy_cli::run(action, &path, &cfg, &backend, &data, &project);
+        return policy_cli::run(action, &path, &cfg, &client, &data, &project);
     }
     let mut launch = None;
     // --help and --version run without a login.
@@ -261,8 +262,8 @@ fn run(mut cli: Cli) -> Result<i32> {
                         record.container
                     );
                 }
-                backend.require_owned(&record)?;
-                backend.checked(&["stop", &record.container])?;
+                backend::require_owned(&client, &record)?;
+                client.stop(&record.container)?;
                 println!("stopped {}", record.container);
             }
             return Ok(0);
@@ -274,9 +275,9 @@ fn run(mut cli: Cli) -> Result<i32> {
             FileExt::try_lock_exclusive(&sessions)
                 .context("active sessions; close them before recreating")?;
             if let Some(record) = project.record(&data)? {
-                backend.require_owned(&record)?;
-                backend.checked(&["stop", &record.container])?;
-                backend.checked(&["delete", &record.container])?;
+                backend::require_owned(&client, &record)?;
+                client.stop(&record.container)?;
+                client.delete(&record.container)?;
                 fs::remove_file(project.record_path(&data))?;
                 println!(
                     "removed {} root filesystem; home volume {} is preserved",
@@ -286,17 +287,17 @@ fn run(mut cli: Cli) -> Result<i32> {
             return Ok(0);
         }
         Action::Cleanup { all_delete, target } => {
-            return cleanup::run(target, all_delete, &backend, &data, &project, &image);
+            return cleanup::run(target, all_delete, &client, &data, &project, &image);
         }
         _ => {}
     }
-    backend.ensure_service()?;
+    backend::ensure_service(&client)?;
     let lifecycle = project::lock(&data, &project.key, "lifecycle")?;
     FileExt::lock_exclusive(&lifecycle)?;
     let sessions = project::lock(&data, &project.key, "sessions")?;
     FileExt::lock_shared(&sessions)?;
-    let record = runtime::ensure(&backend, &data, &project, &cfg, &spec)?;
-    policy_cli::sync(&backend, &record, &cfg)?;
+    let record = runtime::ensure(&client, &data, &project, &cfg, &spec)?;
+    policy_cli::sync(&client, &record, &cfg)?;
     if !record.ports.is_empty() {
         eprintln!("jail: {}", record.container);
         for port in &record.ports {
@@ -306,37 +307,30 @@ fn run(mut cli: Cli) -> Result<i32> {
     if let Action::Auth { tool } = &action {
         FileExt::try_lock_exclusive(&sessions)
             .context("close active sessions before re-importing authentication")?;
-        auth::import(&backend, &record, &data, tool, true)?;
+        auth::import(&client, &record, &data, tool, true)?;
         return Ok(0);
     }
     let (tool, agent_args) = launch.context("unsupported command")?;
     let host_login = cfg.auth.import_host && needs_login;
     if host_login {
-        auth::import(&backend, &record, &data, &tool, false)?;
+        auth::import(&client, &record, &data, &tool, false)?;
     }
     drop(lifecycle);
-    let mut args = vec!["exec".to_owned(), "--interactive".into()];
+    let mut exec = client.exec(&record.container);
+    exec.interactive();
     for key in &cfg.environment.pass {
-        args.extend(["--env".into(), key.clone()]);
+        exec.pass_env(key);
     }
     if let Ok(term) = std::env::var("TERM") {
-        args.extend(["--env".into(), format!("TERM={term}")]);
+        exec.env("TERM", &term);
     }
     if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-        args.push("--tty".into());
+        exec.tty();
     }
-    args.extend([
-        "--user".into(),
-        "root".into(),
-        "--workdir".into(),
-        project.cwd.to_string_lossy().into_owned(),
-        record.container.clone(),
-        GUEST.into(),
-        "launch".into(),
-        tool.clone(),
-    ]);
+    exec.user("root").workdir(&project.cwd);
+    let mut args = vec![GUEST.to_owned(), "launch".into(), tool.clone()];
     args.extend(agent_args);
-    let mut command = backend.command(&args);
+    let mut command = exec.command(&args);
     let auto_stop = cli.auto_stop || cfg.lifecycle.auto_stop;
     let session = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
         Session::Pty
@@ -375,7 +369,7 @@ fn run(mut cli: Cli) -> Result<i32> {
     FileExt::lock_exclusive(&lifecycle)?;
     let sessions = project::lock(&data, &project.key, "sessions")?;
     if FileExt::try_lock_exclusive(&sessions).is_ok() {
-        if let Err(e) = backend.checked(&["stop", &record.container]) {
+        if let Err(e) = client.stop(&record.container) {
             eprintln!("jail: auto-stop failed: {e:#}");
         }
     } else {

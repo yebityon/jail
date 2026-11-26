@@ -3,14 +3,14 @@
 //! are refused. --all-delete first deletes every container jail has a record
 //! of, so it removes all of them.
 use crate::{
-    backend::{container_id, Backend},
+    apple_container::{Client, Container, Image, Volume},
+    backend::{self, PROJECT_LABEL},
     project::{self, volume_key, Project, Record},
     runtime::{build_context, image_name},
 };
 use anyhow::{bail, Context, Result};
 use clap::Subcommand;
 use fs2::FileExt;
-use serde_json::Value;
 use std::{fs, path::Path};
 
 #[derive(Subcommand)]
@@ -27,58 +27,26 @@ pub enum Target {
     },
 }
 
-fn strings<'a>(value: &'a Value, out: &mut Vec<&'a str>) {
-    match value {
-        Value::String(s) => out.push(s),
-        Value::Array(items) => items.iter().for_each(|v| strings(v, out)),
-        Value::Object(map) => map.values().for_each(|v| strings(v, out)),
-        _ => {}
-    }
-}
-/// Containers that may use `name`. The container JSON layout differs between
-/// backend versions, so any mention counts; jail state covers its own records.
-fn users(containers: &[Value], records: &[Record], name: &str) -> Vec<String> {
+/// Containers that may use `name`. Any mention counts, since the container
+/// JSON layout differs between versions; jail state covers its own records.
+fn users(containers: &[Container], records: &[Record], name: &str) -> Vec<String> {
     let mut out = vec![];
     for entry in containers {
-        let id = container_id(entry).unwrap_or("unnamed container");
-        let mut text = vec![];
-        strings(entry, &mut text);
+        let id = entry.id().unwrap_or("unnamed container");
         let recorded = records
             .iter()
             .any(|r| r.container == id && (r.volume == name || r.image == name));
-        if recorded || text.iter().any(|s| s.contains(name)) {
+        if recorded || entry.mentions(name) {
             out.push(id.to_owned());
         }
     }
     out
 }
-fn exists(backend: &Backend, kind: &str, name: &str) -> bool {
-    backend
-        .command(&[kind, "inspect", name])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+fn volume_entry(entry: &Volume) -> Option<&str> {
+    entry.name().filter(|name| volume_key(name).is_some())
 }
-fn listed(backend: &Backend, kind: &str) -> Result<Vec<Value>> {
-    let value: Value =
-        serde_json::from_slice(&backend.capture(&[kind, "list", "--format", "json"])?)?;
-    value
-        .as_array()
-        .cloned()
-        .with_context(|| format!("unexpected {kind} list JSON"))
-}
-fn volume_entry(entry: &Value) -> Option<&str> {
-    entry
-        .get("id")
-        .or_else(|| entry.pointer("/configuration/name"))
-        .and_then(Value::as_str)
-        .filter(|name| volume_key(name).is_some())
-}
-fn image_entry(entry: &Value) -> Option<&str> {
-    entry
-        .pointer("/configuration/name")
-        .and_then(Value::as_str)
-        .and_then(image_name)
+fn image_entry(entry: &Image) -> Option<&str> {
+    entry.name().and_then(image_name)
 }
 /// Serialize with image builds and container creation, which re-checks the
 /// image under the allocation lock before running.
@@ -89,26 +57,23 @@ fn image_locks(data: &Path) -> Result<[fs::File; 2]> {
     FileExt::lock_exclusive(&port_allocation)?;
     Ok([image_build, port_allocation])
 }
-fn date(entry: &Value) -> &str {
-    let date = entry
-        .pointer("/configuration/creationDate")
-        .and_then(Value::as_str)
-        .unwrap_or("");
+fn date(created: Option<&str>) -> &str {
+    let date = created.unwrap_or("");
     date.get(..10).unwrap_or(date)
 }
 
 pub fn run(
     target: Option<Target>,
     all_delete: bool,
-    backend: &Backend,
+    client: &Client,
     data: &Path,
     project: &Project,
     current: &str,
 ) -> Result<i32> {
-    backend.ensure_service()?;
+    backend::ensure_service(client)?;
     match target {
-        None if all_delete => delete_all(backend, data),
-        None => list(backend, data, project, current),
+        None if all_delete => delete_all(client, data),
+        None => list(client, data, project, current),
         Some(Target::Volume { mut names }) => {
             names.sort();
             names.dedup();
@@ -118,7 +83,7 @@ pub fn run(
                 })?;
             }
             for name in &names {
-                remove_volume(backend, data, name)?;
+                remove_volume(client, data, name)?;
             }
             Ok(0)
         }
@@ -132,7 +97,7 @@ pub fn run(
             }
             let _locks = image_locks(data)?;
             for tag in &tags {
-                remove_image(backend, data, tag)?;
+                remove_image(client, data, tag)?;
             }
             Ok(0)
         }
@@ -142,7 +107,7 @@ pub fn run(
 /// Deletes every container jail has a record of, then every jail-owned home
 /// volume and image. Other containers, volumes and images are never listed as
 /// candidates, so one of them still using a jail resource stops the deletion.
-fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
+fn delete_all(client: &Client, data: &Path) -> Result<i32> {
     let records = project::records(data)?;
     // Refuse before deleting anything while any session is active.
     let mut locks = vec![];
@@ -161,9 +126,9 @@ fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
     }
     let mut containers = 0;
     for record in &records {
-        if backend.owned_state(record)?.is_some() {
-            backend.checked(&["stop", &record.container])?;
-            backend.checked(&["delete", &record.container])?;
+        if backend::owned_state(client, record)?.is_some() {
+            client.stop(&record.container)?;
+            client.delete(&record.container)?;
             println!("removed container {}", record.container);
             containers += 1;
         }
@@ -171,22 +136,24 @@ fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
     }
     // remove_volume takes each project's lifecycle lock itself.
     drop(locks);
-    let volumes: Vec<String> = listed(backend, "volume")?
+    let volumes: Vec<String> = client
+        .volumes()?
         .iter()
         .filter_map(volume_entry)
         .map(str::to_owned)
         .collect();
-    let images: Vec<String> = listed(backend, "image")?
+    let images: Vec<String> = client
+        .images()?
         .iter()
         .filter_map(image_entry)
         .map(str::to_owned)
         .collect();
     for name in &volumes {
-        remove_volume(backend, data, name)?;
+        remove_volume(client, data, name)?;
     }
     let _locks = image_locks(data)?;
     for tag in &images {
-        remove_image(backend, data, tag)?;
+        remove_image(client, data, tag)?;
     }
     println!(
         "removed {} in total",
@@ -195,39 +162,39 @@ fn delete_all(backend: &Backend, data: &Path) -> Result<i32> {
     Ok(0)
 }
 
-fn remove_volume(backend: &Backend, data: &Path, name: &str) -> Result<()> {
+fn remove_volume(client: &Client, data: &Path, name: &str) -> Result<()> {
     let key = volume_key(name).context("not a jail home volume")?;
     // Launch, stop and recreate of that project wait while this runs.
     let lifecycle = project::lock(data, key, "lifecycle")?;
     FileExt::lock_exclusive(&lifecycle)?;
-    let users = users(&backend.list()?, &project::records(data)?, name);
+    let users = users(&client.list()?, &project::records(data)?, name);
     if !users.is_empty() {
         bail!(
             "{name} is used by container {}; close its sessions and run jail recreate in that project first",
             users.join(", ")
         );
     }
-    if !exists(backend, "volume", name) {
+    if !client.volume_exists(name) {
         bail!("home volume {name} does not exist");
     }
-    backend.checked(&["volume", "delete", name])?;
+    client.delete_volume(name)?;
     println!("removed home volume {name}");
     Ok(())
 }
 
 /// The caller holds `image_locks`.
-fn remove_image(backend: &Backend, data: &Path, tag: &str) -> Result<()> {
-    let users = users(&backend.list()?, &project::records(data)?, tag);
+fn remove_image(client: &Client, data: &Path, tag: &str) -> Result<()> {
+    let users = users(&client.list()?, &project::records(data)?, tag);
     if !users.is_empty() {
         bail!(
             "{tag} is used by container {}; recreate those projects first",
             users.join(", ")
         );
     }
-    if !exists(backend, "image", tag) {
+    if !client.image_exists(tag) {
         bail!("image {tag} does not exist");
     }
-    backend.checked(&["image", "delete", tag])?;
+    client.delete_image(tag)?;
     let context = build_context(data, tag);
     if context.exists() {
         fs::remove_dir_all(&context)?;
@@ -236,8 +203,8 @@ fn remove_image(backend: &Backend, data: &Path, tag: &str) -> Result<()> {
     Ok(())
 }
 
-fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Result<i32> {
-    let containers = backend.list()?;
+fn list(client: &Client, data: &Path, project: &Project, current: &str) -> Result<i32> {
+    let containers = client.list()?;
     let records = project::records(data)?;
     let state = |name: &str| {
         let users = users(&containers, &records, name);
@@ -249,7 +216,7 @@ fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Res
     };
     println!("Home volumes (deleting one removes that project's CLI settings and history):");
     let mut count = 0;
-    for entry in listed(backend, "volume")? {
+    for entry in client.volumes()? {
         let Some(name) = volume_entry(&entry) else {
             continue;
         };
@@ -259,18 +226,13 @@ fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Res
             .iter()
             .find(|r| r.volume == name)
             .map(|r| r.root.display().to_string())
-            .or_else(|| {
-                entry
-                    .pointer("/configuration/labels/io.jail.project")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
+            .or_else(|| entry.label(PROJECT_LABEL).map(str::to_owned))
             .or_else(|| (key == project.key).then(|| project.root.display().to_string()))
             .unwrap_or_else(|| "project unknown".into());
         println!(
             "  {name}  {}  created {}  {root}",
             state(name),
-            date(&entry)
+            date(entry.created())
         );
         count += 1;
     }
@@ -279,14 +241,11 @@ fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Res
     }
     println!("Images:");
     count = 0;
-    for entry in listed(backend, "image")? {
+    for entry in client.images()? {
         let Some(tag) = image_entry(&entry) else {
             continue;
         };
-        let size: u64 = entry["variants"]
-            .as_array()
-            .map(|v| v.iter().filter_map(|v| v["size"].as_u64()).sum())
-            .unwrap_or(0);
+        let size = entry.size();
         println!(
             "  {tag}  {}{}  created {}  {} MiB",
             state(tag),
@@ -295,7 +254,7 @@ fn list(backend: &Backend, data: &Path, project: &Project, current: &str) -> Res
             } else {
                 ""
             },
-            date(&entry),
+            date(entry.created()),
             size / 1024 / 1024
         );
         count += 1;
@@ -335,8 +294,10 @@ mod tests {
     #[test]
     fn any_container_mention_counts_as_use() {
         let containers = vec![
-            serde_json::json!({"configuration": {"id": "a", "mounts": [{"source": "/v/jail-0123456789abcdef-home/volume.img"}]}}),
-            serde_json::json!({"configuration": {"id": "b"}}),
+            Container::from(
+                serde_json::json!({"configuration": {"id": "a", "mounts": [{"source": "/v/jail-0123456789abcdef-home/volume.img"}]}}),
+            ),
+            Container::from(serde_json::json!({"configuration": {"id": "b"}})),
         ];
         assert_eq!(
             users(&containers, &[], "jail-0123456789abcdef-home"),

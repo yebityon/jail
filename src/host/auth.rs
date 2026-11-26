@@ -1,5 +1,6 @@
 use crate::{
-    backend::Backend,
+    apple_container::Client,
+    backend,
     project::{self, Record},
     user_home,
 };
@@ -160,7 +161,7 @@ fn sanitize(tool: &str, bytes: &[u8]) -> Result<Vec<u8>> {
 /// the host has none. A launch keeps an existing login, and on a terminal it
 /// only warns about a missing one.
 pub fn import(
-    backend: &Backend,
+    client: &Client,
     record: &Record,
     data: &Path,
     tool: &str,
@@ -170,16 +171,10 @@ pub fn import(
         bail!("auth tool must be claude or codex");
     }
     if !explicit {
-        let output = backend
-            .command(&[
-                "exec",
-                "--user",
-                "root",
-                &record.container,
-                GUEST,
-                "has-auth",
-                tool,
-            ])
+        let output = client
+            .exec(&record.container)
+            .user("root")
+            .command(&[GUEST, "has-auth", tool])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -207,7 +202,7 @@ pub fn import(
             host_login_command(tool)
         );
     };
-    send(backend, record, tool, &bytes, "import-auth")?;
+    send(client, record, tool, &bytes, "import-auth")?;
     save_fingerprint(data, record, tool, &fingerprint)
 }
 
@@ -245,7 +240,7 @@ pub fn watch(record: &Record, data: &Path, tool: &str) -> Watch {
     let data = data.to_owned();
     let tool = tool.to_owned();
     let thread = std::thread::spawn(move || {
-        let backend = Backend::new();
+        let client = backend::client();
         let key = project::key(&record.root);
         let mut owner = None;
         let mut failure = None;
@@ -261,7 +256,7 @@ pub fn watch(record: &Record, data: &Path, tool: &str) -> Watch {
             }
             if owner.is_some() {
                 // Failures are retried when the host login changes again.
-                match follow(&backend, &record, &data, &tool) {
+                match follow(&client, &record, &data, &tool) {
                     Ok(true) => failure = None,
                     Ok(false) => {}
                     Err(e) => failure = Some(e),
@@ -279,7 +274,7 @@ pub fn watch(record: &Record, data: &Path, tool: &str) -> Watch {
     }
 }
 /// Returns whether the host login changed and a sync was attempted.
-fn follow(backend: &Backend, record: &Record, data: &Path, tool: &str) -> Result<bool> {
+fn follow(client: &Client, record: &Record, data: &Path, tool: &str) -> Result<bool> {
     let fingerprint = fingerprint(tool)?;
     if fs::read_to_string(fingerprint_path(data, record, tool)).ok() == Some(fingerprint.clone()) {
         return Ok(false);
@@ -289,44 +284,26 @@ fn follow(backend: &Backend, record: &Record, data: &Path, tool: &str) -> Result
     // prompt again every interval. A partly written file changes the marker.
     save_fingerprint(data, record, tool, &fingerprint)?;
     if let Some(bytes) = credentials? {
-        pipe(backend, record, tool, &bytes, "sync-auth")?;
+        pipe(client, record, tool, &bytes, "sync-auth")?;
     }
     Ok(true)
 }
 
-fn send(
-    backend: &Backend,
-    record: &Record,
-    tool: &str,
-    bytes: &[u8],
-    operation: &str,
-) -> Result<()> {
-    pipe(backend, record, tool, bytes, operation)?;
+fn send(client: &Client, record: &Record, tool: &str, bytes: &[u8], operation: &str) -> Result<()> {
+    pipe(client, record, tool, bytes, operation)?;
     eprintln!(
         "jail: {tool} subscription login loaded into root-only proxy; agent receives placeholders"
     );
     Ok(())
 }
 
-fn pipe(
-    backend: &Backend,
-    record: &Record,
-    tool: &str,
-    bytes: &[u8],
-    operation: &str,
-) -> Result<()> {
+fn pipe(client: &Client, record: &Record, tool: &str, bytes: &[u8], operation: &str) -> Result<()> {
     // Pipe secrets through stdin, never argv, environment, host state, or logs.
-    let mut child = backend
-        .command(&[
-            "exec",
-            "--interactive",
-            "--user",
-            "root",
-            &record.container,
-            GUEST,
-            operation,
-            tool,
-        ])
+    let mut child = client
+        .exec(&record.container)
+        .interactive()
+        .user("root")
+        .command(&[GUEST, operation, tool])
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())

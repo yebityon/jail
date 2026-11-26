@@ -406,7 +406,7 @@ python3 scripts/protocol-smoke-test.py
 
 コンテナのテストは専用の一時コンテナとホームvolumeを作成・削除し、既存プロジェクトには触れません。smoke testはホスト認証なしで保護パスの置換拒否・通信拒否ログ／live reload・各制限・転送・Codexサンドボックスを確認します。auth testはホストログインをroot専用tmpfsへ取り込み、認証認識・トークン非公開・モデル一覧の読み取りを確認します。推論は実行しません。protocol testはダミー認証とlocalhostの模擬SSEサーバーだけを使い、macOS sandboxで外向き通信を遮断します。
 
-ホスト側のエントリーポイントは[src/main.rs](src/main.rs)、ランタイム管理は[src/runtime.rs](src/runtime.rs)です。Linux側のスーパーバイザーは[src/bin/jail-guest.rs](src/bin/jail-guest.rs)です。
+ホスト側のエントリーポイントは[src/host/main.rs](src/host/main.rs)、ランタイム管理は[src/host/runtime.rs](src/host/runtime.rs)です。Appleの`container`コマンドの呼び出しは、すべて[src/host/apple_container](src/host/apple_container)を通します。Linux側のスーパーバイザーは[src/container/main.rs](src/container/main.rs)です。両側が使うコードは[src/shared](src/shared)にあります。
 
 `JAIL_HOME`でホストの管理状態・ビルド用ディレクトリ（通常は`~/.local/share/jail`）を変更できます。`JAIL_CONTAINER_BIN`はテスト用のbackend実行ファイルを指定します。変更した動作のテストを追加し、英語・日本語のREADMEを合わせて更新してください。予定する作業は[TODO.md](TODO.md)で管理しています。
 
