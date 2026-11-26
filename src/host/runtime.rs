@@ -44,6 +44,8 @@ const FILES: &[(&str, &str)] = &[
     ),
     ("Dockerfile", include_str!("../../container/Dockerfile")),
 ];
+/// Label marking a container that jail deletes when its session ends.
+const EPHEMERAL_LABEL: &str = "io.jail.ephemeral";
 const IMAGE_PREFIX: &str = "jail-runtime:";
 /// Hex digits of an image tag.
 const TAG_DIGITS: usize = 20;
@@ -112,7 +114,8 @@ pub fn ensure(
     cfg: &Config,
     spec: &str,
 ) -> Result<Record> {
-    let volume = project::home_volume(&project.key);
+    // An ephemeral container keeps its home in its own root filesystem.
+    let volume = (!project.ephemeral).then(|| project::home_volume(&project.key));
     let image = image_tag(cfg);
     let existing = project.record(data)?;
     if let Some(record) = &existing {
@@ -155,10 +158,10 @@ pub fn ensure(
             container
         );
     }
-    if !client.volume_exists(&volume) {
+    if let Some(volume) = volume.as_deref().filter(|v| !client.volume_exists(v)) {
         // The label lets jail cleanup name the project after its state is gone.
         client.create_volume(
-            &volume,
+            volume,
             &[(PROJECT_LABEL, project.root.display().to_string().as_str())],
         )?;
     }
@@ -168,7 +171,11 @@ pub fn ensure(
         cfg.network.published_ports.as_slice()
     };
     let (ports, reservations) = allocate_ports(requested, cfg.network.auto_port)?;
-    let guard = crate::write_guard::prepare(&project.root, cfg)?;
+    let guard = if project.ephemeral {
+        Default::default()
+    } else {
+        crate::write_guard::prepare(&project.root, cfg)?
+    };
     let mut run = Run::new(&container, &image);
     run.detach()
         .label(PROJECT_LABEL, &project.root.display().to_string())
@@ -177,6 +184,9 @@ pub fn ensure(
         .memory(&cfg.resources.memory)
         .cap_drop("ALL")
         .tmpfs("/run");
+    if project.ephemeral {
+        run.label(EPHEMERAL_LABEL, "true");
+    }
     // The trusted supervisor alone sets firewall and user identity. Agents drop
     // every capability and set no_new_privs before executing a CLI.
     for cap in [
@@ -193,15 +203,20 @@ pub fn ensure(
         run.cap_add(cap);
     }
     let read_only = cfg.workspace.read_only || !cfg.tools.edit;
-    run.bind(&project.root, &project.root, read_only)
-        .volume(&volume, "/home/jail")
-        .env("JAIL_CONFIG_JSON", &serde_json::to_string(cfg)?)
-        .env("JAIL_WRITE_GUARD", &serde_json::to_string(&guard)?);
-    for mount in &cfg.workspace.mounts {
-        run.bind(&mount.source, &mount.target, mount.read_only || read_only);
+    // An ephemeral container mounts nothing from the host.
+    if let Some(volume) = &volume {
+        run.bind(&project.root, &project.root, read_only)
+            .volume(volume, "/home/jail");
     }
-    for hidden in &cfg.workspace.hidden {
-        run.masked_path(&project.root.join(hidden));
+    run.env("JAIL_CONFIG_JSON", &serde_json::to_string(cfg)?)
+        .env("JAIL_WRITE_GUARD", &serde_json::to_string(&guard)?);
+    if !project.ephemeral {
+        for mount in &cfg.workspace.mounts {
+            run.bind(&mount.source, &mount.target, mount.read_only || read_only);
+        }
+        for hidden in &cfg.workspace.hidden {
+            run.masked_path(&project.root.join(hidden));
+        }
     }
     for port in &ports {
         run.publish(&port.specification());
@@ -226,6 +241,20 @@ pub fn ensure(
         eprintln!("jail: network is disabled; online model requests cannot run");
     }
     Ok(record)
+}
+/// Deletes an ephemeral project's container, if it was created, and its jail
+/// state. The caller has released its own locks of that project.
+pub fn discard(client: &Client, data: &Path, project: &Project) -> Result<()> {
+    let lifecycle = project::lock(data, &project.key, "lifecycle")?;
+    FileExt::lock_exclusive(&lifecycle)?;
+    if let Some(record) = project.record(data)? {
+        if backend::owned_state(client, &record)?.is_some() {
+            client.stop(&record.container)?;
+            client.delete(&record.container)?;
+        }
+    }
+    fs::remove_dir_all(project::dir(data, &project.key))?;
+    Ok(())
 }
 fn allocate_ports(requested: &[u16], auto_port: bool) -> Result<(Vec<Port>, Vec<TcpListener>)> {
     let mut ports = Vec::new();

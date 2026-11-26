@@ -533,6 +533,46 @@ fn edit_off_creates_read_only_mount_and_rejects_override() {
 }
 
 #[test]
+fn allow_write_sends_writable_paths_to_the_guest_and_conflicts_with_read_only() {
+    let f = Fixture::new();
+    let workspace = f.tmp.path().join("project with spaces");
+    fs::create_dir(workspace.join("src")).unwrap();
+    fs::write(
+        &f.config,
+        "[auth]\nimport_host=false\n[workspace]\nallow_write=['src/', 'out/']\n",
+    )
+    .unwrap();
+    succeeds(&f.run(&["claude", "-p", "edit src"]));
+    let calls = f.calls();
+    let run = calls.iter().find(|a| a[0] == "run").unwrap();
+    // The host shares the workspace writable; the guest makes the rest read-only.
+    assert!(run
+        .iter()
+        .any(|a| a.starts_with("type=bind,") && !a.ends_with(",readonly")));
+    let guard: Value = serde_json::from_str(
+        run.iter()
+            .find_map(|a| a.strip_prefix("JAIL_WRITE_GUARD="))
+            .unwrap(),
+    )
+    .unwrap();
+    let root = workspace.canonicalize().unwrap();
+    assert_eq!(guard["root"], root.to_str().unwrap());
+    assert_eq!(
+        guard["writable"],
+        serde_json::json!([root.join("out"), root.join("src")])
+    );
+    assert!(workspace.join("out").is_dir());
+    fs::write(
+        &f.config,
+        "[auth]\nimport_host=false\n[workspace]\nread_only=true\nallow_write=['src/']\n",
+    )
+    .unwrap();
+    let result = f.run(&["claude", "--version"]);
+    assert!(!result.status.success());
+    assert!(String::from_utf8_lossy(&result.stderr).contains("allow_write"));
+}
+
+#[test]
 fn auto_stop_restarts_and_configuration_changes_require_explicit_recreate() {
     let f = Fixture::new();
     succeeds(&f.run(&["--auto-stop", "codex", "exec", "hello"]));
@@ -612,6 +652,50 @@ fn dry_run_never_contacts_backend_or_imports_credentials() {
         serde_json::json!([3000, 5173, 8000, 8080])
     );
     assert!(f.calls().is_empty());
+}
+
+#[test]
+fn ephemeral_session_mounts_nothing_and_is_deleted_on_exit() {
+    let f = Fixture::new();
+    fs::write(
+        &f.config,
+        "[auth]\nimport_host=false\n[network]\npublished_ports=[]\n[workspace]\nhidden=['.env']\nmounts=[{source='.',target='/extra/config'}]\n",
+    )
+    .unwrap();
+    let out = f.run(&["--dry-run", "--ephemeral", "claude"]);
+    succeeds(&out);
+    let plan: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert!(plan["container"]
+        .as_str()
+        .unwrap()
+        .starts_with("jail-ephemeral-"));
+    assert!(plan["workspace"].is_null() && plan["home_volume"].is_null());
+    assert_eq!(plan["cwd"], "/home/jail");
+    let out = f
+        .command(&["--ephemeral", "codex", "exec", "hi"])
+        .env("JAIL_TEST_EXIT", "7")
+        .output()
+        .unwrap();
+    assert_eq!(out.status.code(), Some(7));
+    let calls = f.calls();
+    let run = calls.iter().find(|a| a[0] == "run").unwrap();
+    assert!(!run.iter().any(|a| a == "--mount" || a == "--masked-path"));
+    assert!(run.iter().any(|a| a == "io.jail.ephemeral=true"));
+    assert!(!calls.iter().any(|a| a[0] == "volume"));
+    let exec = calls
+        .iter()
+        .find(|a| a[0] == "exec" && a.iter().any(|s| s == "launch"))
+        .unwrap();
+    assert!(exec.windows(2).any(|w| w == ["--workdir", "/home/jail"]));
+    // The container and its jail state are gone; the next launch is fresh.
+    let state: Value =
+        serde_json::from_slice(&fs::read(f.tmp.path().join("containers.json")).unwrap()).unwrap();
+    assert_eq!(state, serde_json::json!([]));
+    let projects = f.tmp.path().join("state/projects");
+    assert_eq!(fs::read_dir(projects).unwrap().count(), 0);
+    for args in [vec!["--ephemeral", "stop"], vec!["--ephemeral", "recreate"]] {
+        assert!(!f.run(&args).status.success(), "{args:?}");
+    }
 }
 
 #[test]

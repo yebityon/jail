@@ -19,10 +19,13 @@ const DEFAULTS: &[(&str, bool)] = &[
     (".zshrc", false),
     (".ripgreprc", false),
 ];
-#[derive(serde::Serialize)]
+#[derive(Default, serde::Serialize)]
 pub struct Guard {
     pub anchors: Vec<PathBuf>,
     pub readonly: Vec<PathBuf>,
+    /// The workspace, set only when writes are limited to `writable`.
+    pub root: Option<PathBuf>,
+    pub writable: Vec<PathBuf>,
 }
 fn safe_components(root: &Path, relative: &str) -> Result<PathBuf> {
     let mut path = root.to_path_buf();
@@ -47,10 +50,7 @@ fn safe_components(root: &Path, relative: &str) -> Result<PathBuf> {
     Ok(path)
 }
 pub fn prepare(root: &Path, cfg: &Config) -> Result<Guard> {
-    let mut guard = Guard {
-        anchors: vec![],
-        readonly: vec![],
-    };
+    let mut guard = Guard::default();
     if cfg.workspace.read_only || !cfg.tools.edit {
         return Ok(guard);
     }
@@ -132,10 +132,42 @@ pub fn prepare(root: &Path, cfg: &Config) -> Result<Guard> {
     guard.anchors.dedup();
     guard.readonly.sort();
     guard.readonly.dedup();
+    // An allowlist makes the rest of the workspace read-only, even when every
+    // entry is hidden. Protected paths inside an allowed path stay read-only.
+    if !cfg.workspace.allow_write.is_empty() {
+        guard.root = Some(root.to_path_buf());
+    }
+    for relative in &cfg.workspace.allow_write {
+        if cfg
+            .workspace
+            .hidden
+            .iter()
+            .any(|h| Path::new(relative).starts_with(h))
+        {
+            continue;
+        }
+        let target = safe_components(root, relative)?;
+        if !target.exists() {
+            if !relative.ends_with('/') {
+                bail!(
+                    "writable path does not exist: {}; use a trailing / to create a directory",
+                    target.display()
+                );
+            }
+            fs::create_dir_all(&target)?;
+            eprintln!("jail: created writable directory {}", target.display());
+            safe_components(root, relative)?;
+        }
+        guard.writable.push(target);
+    }
+    guard
+        .writable
+        .sort_by(|a, b| (a.components().count(), a).cmp(&(b.components().count(), b)));
+    guard.writable.dedup();
     for mount in &cfg.workspace.mounts {
         if !mount.read_only
             && (mount.source.starts_with(root) || root.starts_with(&mount.source))
-            && !guard.readonly.is_empty()
+            && (!guard.readonly.is_empty() || guard.root.is_some())
         {
             bail!("writable extra mounts overlapping the workspace can bypass write protection; use a read-only extra mount");
         }
@@ -196,6 +228,40 @@ mod tests {
         let guard = prepare(tmp.path(), &cfg).unwrap();
         assert!(guard.anchors.is_empty());
         assert!(guard.readonly.contains(&tmp.path().join("trusted")));
+    }
+    #[test]
+    fn allow_write_limits_writes_and_fails_closed() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::create_dir(tmp.path().join("src")).unwrap();
+        fs::write(tmp.path().join("notes.md"), "x").unwrap();
+        let mut cfg = Config::default();
+        cfg.workspace.allow_write = vec!["src".into(), "notes.md".into(), "out/".into()];
+        let guard = prepare(tmp.path(), &cfg).unwrap();
+        assert_eq!(guard.root.as_deref(), Some(tmp.path()));
+        for path in ["src", "notes.md", "out"] {
+            assert!(guard.writable.contains(&tmp.path().join(path)), "{path}");
+        }
+        assert!(tmp.path().join("out").is_dir());
+        // Default protection still applies alongside the allowlist.
+        assert!(guard.readonly.contains(&tmp.path().join(".mcp.json")));
+        cfg.workspace.allow_write = vec!["missing".into()];
+        assert!(prepare(tmp.path(), &cfg).is_err());
+        std::os::unix::fs::symlink("/", tmp.path().join("escape")).unwrap();
+        cfg.workspace.allow_write = vec!["escape/".into()];
+        assert!(prepare(tmp.path(), &cfg).is_err());
+        // A hidden entry is skipped, but the workspace stays read-only.
+        cfg.workspace.allow_write = vec!["secrets/".into()];
+        cfg.workspace.hidden = vec!["secrets".into()];
+        let guard = prepare(tmp.path(), &cfg).unwrap();
+        assert!(guard.root.is_some() && guard.writable.is_empty());
+        assert!(!tmp.path().join("secrets").exists());
+        cfg.workspace.mounts.push(jail::config::Mount {
+            source: tmp.path().join("src"),
+            target: "/extra/alias".into(),
+            read_only: false,
+        });
+        cfg.workspace.protect_sensitive = false;
+        assert!(prepare(tmp.path(), &cfg).is_err());
     }
     #[test]
     fn worktree_pointer_is_protected_and_mutable_alias_is_rejected() {

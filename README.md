@@ -98,6 +98,7 @@ jail --dry-run claude --resume
 | Command | Purpose |
 | --- | --- |
 | `jail claude [args…]` / `jail codex [args…]` | Launch the native CLI inside the project's container |
+| `jail --ephemeral claude` | Launch the CLI in a throwaway container with no mounts, deleted on exit |
 | `jail stop [--all]` | Stop managed containers that have no active jail sessions |
 | `jail stop --force` | Explicitly stop the current container even with active sessions |
 | `jail auth claude` / `jail auth codex` | Explicitly re-import the tool's host login |
@@ -147,6 +148,16 @@ jail cleanup --all-delete
 `--all-delete` asks for no confirmation. It first stops and deletes every container jail has a record of, then deletes jail's home volumes and images one by one by name. It refuses to start while any jail session is active. It never touches containers jail has no record of, or volumes and images in other formats; if one of those containers uses a jail volume or image, the deletion stops with an error.
 
 Only names in jail's own formats (`jail-<16 hex>-home`, `jail-runtime:<20 hex>`) are accepted. A volume or image used by any container is refused; to free a project's home volume, close its sessions and run `jail recreate` in that project first. Deleting a home volume permanently removes that project's CLI settings and history; the next launch creates an empty one. A deleted image is rebuilt when a configuration needs it again. New home volumes carry their project path as a label, so the path remains visible after jail state is removed.
+
+### Ephemeral sessions
+
+`--ephemeral` starts a new container that mounts no host directory: not the project, not `workspace.mounts`, and no home volume. The agent starts in `/home/jail` inside the container, and everything it writes, including CLI settings and history, is deleted with the container when the session ends. The host login is still imported as usual, and network policy, resources and port forwarding follow the configuration. It works from any directory.
+
+```sh
+jail --ephemeral claude
+```
+
+If jail is killed before it can delete the container, `jail cleanup --all-delete` removes it.
 
 ## Development servers
 
@@ -229,6 +240,17 @@ deny_write = ["package.json", "scripts/trusted/"]
 ```
 
 Use a trailing `/` for missing directories. Set `protect_sensitive = false` to disable defaults; explicit `deny_write` still applies. Mount changes require `jail recreate`. Host-side edits remain possible and are outside the agent isolation boundary.
+
+### Writable paths
+
+To let the agent write only specific paths, list them in `allow_write`. Everything else in the workspace becomes read-only:
+
+```toml
+[workspace]
+allow_write = ["src/", "tests/", "CHANGELOG.md"]
+```
+
+Paths are project-relative. A missing path with a trailing `/` is created as a directory; any other missing path is an error. Protected paths inside an allowed path (the defaults above and `deny_write`) stay read-only, and an entry covered by `hidden` is skipped. Each allowed path becomes its own mount, so it cannot be renamed or moved, and files cannot be moved between it and the rest of the workspace. Prefer directories: tools that save a file by replacing it fail on a single-file entry. Git commits need `.git/` in the list. `allow_write` cannot be combined with `read_only = true` or `tools.edit = false`, and writable extra mounts overlapping the workspace are rejected. Changes require `jail recreate`.
 
 ### How allowlist enforcement works
 

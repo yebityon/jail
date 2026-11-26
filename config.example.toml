@@ -15,6 +15,10 @@ hidden = []
 protect_sensitive = true
 # Extra project-relative protected paths; use a trailing / for missing directories.
 deny_write = []
+# When set, the workspace is read-only except these project-relative paths,
+# for example ["src/", "tests/"]. A trailing / creates a missing directory.
+# Protected paths inside them stay read-only.
+allow_write = []
 # Additional host directories are explicit and read-only by default.
 # [[workspace.mounts]]
 # source = "/Users/you/reference"
