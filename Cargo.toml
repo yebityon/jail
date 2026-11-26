@@ -22,9 +22,16 @@ toml_edit = "=0.22.27"
 [dev-dependencies]
 tempfile = "=3.20.0"
 
+[lib]
+path = "src/shared/lib.rs"
+
+[[bin]]
+name = "jail"
+path = "src/mac/main.rs"
+
 [[bin]]
 name = "jail-guest"
-path = "src/bin/jail-guest.rs"
+path = "src/container/main.rs"
 
 [profile.release]
 lto = "thin"

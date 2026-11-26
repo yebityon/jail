@@ -52,7 +52,7 @@ impl Backend {
             .command(args)
             .stdin(Stdio::null())
             .output()
-            .context("Apple container not found; install it and run jail doctor")?;
+            .context("Apple container not found; install it")?;
         if !output.status.success() {
             // Do not include argv: credentials or environment values can be present.
             bail!(
@@ -123,24 +123,6 @@ impl Backend {
             bail!("container {} does not exist", record.container);
         }
         Ok(())
-    }
-    pub fn doctor(&self) -> Result<i32> {
-        println!(
-            "host: {} / {}",
-            std::env::consts::OS,
-            std::env::consts::ARCH
-        );
-        if std::env::consts::OS != "macos" || std::env::consts::ARCH != "aarch64" {
-            bail!("Apple container requires an Apple silicon Mac");
-        }
-        let version = self.capture(&["--version"])?;
-        println!("{}", String::from_utf8_lossy(&version).trim());
-        let status = self.interactive(&["system", "status"])?;
-        if status != 0 {
-            println!("service is stopped; jail will start it on launch");
-        }
-        println!("host authentication will be imported on first launch; no credential contents are printed");
-        Ok(0)
     }
 }
 

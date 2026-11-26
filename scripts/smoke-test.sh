@@ -11,6 +11,15 @@ task_config="$task_repo/tests/config/open.toml"
 task_key="$("$task_cli" --config "$task_config" --dry-run codex --version | python3 -c 'import json,sys; print(json.load(sys.stdin)["project_key"])')"
 if [[ ! "$task_key" =~ ^jail-[0-9a-f]{16}$ ]]; then exit 1; fi
 run_jail() { "$task_cli" --config "$task_config" "$@"; }
+task_record="$JAIL_HOME/projects/$task_key/record.json"
+task_container() { python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["id"])' "$task_record"; }
+# jail has no shell command. Start the container through a normal launch, then
+# run the trusted supervisor's agent shell, as the sandbox diagnostic below does.
+guest_shell() {
+    run_jail codex --version </dev/null >/dev/null
+    container exec --interactive --user root --workdir "$PWD" "$(task_container)" \
+        /usr/local/bin/jail-guest launch shell
+}
 cleanup() {
     # Only the uniquely created test container; no global stop/prune operation.
     run_jail recreate >/dev/null 2>&1 || true
@@ -20,11 +29,9 @@ cleanup() {
 trap cleanup EXIT
 
 run_jail codex --version
-task_id="$(run_jail status --json | python3 -c 'import json,sys; print(json.load(sys.stdin)["containers"][0]["id"])')"
+task_id="$(task_container)"
 if [[ ! "$task_id" =~ ^jail-project-[0-9]{8}-[0-9]{6}-[0-9]{6}$ ]]; then exit 1; fi
 run_jail claude --version
-run_jail status
-run_jail ps
 # Exercise the real native sandbox without a model request. This diagnostic
 # deliberately uses the trusted supervisor, not the restricted public command.
 container exec --user root "$task_id" /usr/local/bin/jail-guest launch codex \
@@ -32,21 +39,21 @@ container exec --user root "$task_id" /usr/local/bin/jail-guest launch codex \
     'test -r /etc/os-release; if touch native-readonly-probe 2>/dev/null; then exit 9; fi'
 test ! -f native-readonly-probe
 printf 'PASS: native Codex sandbox executes commands and denies writes\n'
-printf 'set -e; test "$(id -u)" != 0; touch writable-probe; test -f writable-probe; test "$(grep NoNewPrivs /proc/self/status | awk '\''{print $2}'\'')" = 1; exit\n' | run_jail --auto-stop shell
+printf 'set -e; test "$(id -u)" != 0; touch writable-probe; test -f writable-probe; test "$(grep NoNewPrivs /proc/self/status | awk '\''{print $2}'\'')" = 1; exit\n' | guest_shell
 test -f writable-probe
-run_jail status --json
-printf 'PASS: CLI startup, monitoring, non-root, no_new_privs, workspace write, auto-stop\n'
+run_jail --auto-stop codex --version
+printf 'PASS: CLI startup, non-root, no_new_privs, workspace write, auto-stop\n'
 
 # Protected path replacement and aliases must fail, not just ordinary writes.
-printf 'set -e; for p in .git/config .mcp.json .bashrc; do if echo bad >> "$p" 2>/dev/null; then exit 12; fi; if rm "$p" 2>/dev/null; then exit 13; fi; done; if mv .git .git-moved 2>/dev/null; then exit 14; fi; if touch .git/hooks/bad .claude/bad .codex/bad 2>/dev/null; then exit 15; fi; if ln .git/config alias 2>/dev/null; then exit 16; fi; test -r /home/jail/.codex/auth.json; if cat /run/jail-private/codex.json 2>/dev/null; then exit 17; fi; exit 0\n' | run_jail --auto-stop shell
+printf 'set -e; for p in .git/config .mcp.json .bashrc; do if echo bad >> "$p" 2>/dev/null; then exit 12; fi; if rm "$p" 2>/dev/null; then exit 13; fi; done; if mv .git .git-moved 2>/dev/null; then exit 14; fi; if touch .git/hooks/bad .claude/bad .codex/bad 2>/dev/null; then exit 15; fi; if ln .git/config alias 2>/dev/null; then exit 16; fi; test -r /home/jail/.codex/auth.json; if cat /run/jail-private/codex.json 2>/dev/null; then exit 17; fi; exit 0\n' | guest_shell
 printf 'PASS: sensitive writes, replacement, parent rename and hard-link aliases denied\n'
-printf 'if unshare -Ur -m /bin/sh -c '\''set -e; mkdir -p /tmp/jail-alias; mount --bind "$PWD" /tmp/jail-alias; echo escape >> /tmp/jail-alias/.mcp.json'\'' 2>/dev/null; then exit 18; fi; exit 0\n' | run_jail --auto-stop shell
+printf 'if unshare -Ur -m /bin/sh -c '\''set -e; mkdir -p /tmp/jail-alias; mount --bind "$PWD" /tmp/jail-alias; echo escape >> /tmp/jail-alias/.mcp.json'\'' 2>/dev/null; then exit 18; fi; exit 0\n' | guest_shell
 printf 'PASS: unprivileged mount-namespace alias cannot bypass write protection\n'
 
 check_port_forward() {
-    # Non-root dev server launched through the normal shell path, no auth/model.
-    printf 'node -e '\''require("http").createServer((q,s)=>s.end("jail-port-"+process.getuid())).listen(3000,"0.0.0.0")'\'' >/tmp/jail-port.log 2>&1 &\nexit\n' | run_jail shell
-    task_host_port="$(run_jail status --json | python3 -c 'import json,sys; c=json.load(sys.stdin)["containers"][0]; print(next(p["host"] for p in c["ports"] if p["container"]==3000))')"
+    # Non-root dev server launched through the agent shell, no auth/model.
+    printf 'node -e '\''require("http").createServer((q,s)=>s.end("jail-port-"+process.getuid())).listen(3000,"0.0.0.0")'\'' >/tmp/jail-port.log 2>&1 &\nexit\n' | guest_shell
+    task_host_port="$(python3 -c 'import json,sys; print(next(p["host"] for p in json.load(open(sys.argv[1]))["ports"] if p["container"]==3000))' "$task_record")"
     task_response="$(curl --noproxy '*' -fsS --max-time 5 "http://127.0.0.1:$task_host_port")"
     test "$task_response" = "jail-port-$(id -u)"
     printf 'PASS: host localhost reaches non-root development server\n'
@@ -55,20 +62,20 @@ check_port_forward
 
 run_jail recreate
 task_config="$task_repo/tests/config/readonly.toml"
-printf 'if touch readonly-probe 2>/dev/null; then exit 9; fi; exit 0\n' | run_jail --auto-stop shell
+printf 'if touch readonly-probe 2>/dev/null; then exit 9; fi; exit 0\n' | guest_shell
 test ! -f readonly-probe
 printf 'PASS: workspace write denied\n'
 
 run_jail recreate
 task_config="$task_repo/tests/config/hidden.toml"
 cp "$task_repo/tests/fixtures/example.env" .env
-printf 'set -e; test ! -s .env; exit\n' | run_jail --auto-stop shell
+printf 'set -e; test ! -s .env; exit\n' | guest_shell
 test -s .env
 printf 'PASS: hidden path is masked; host file is preserved\n'
 
 run_jail recreate
 task_config="$task_repo/tests/config/offline.toml"
-printf 'if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 9; fi; exit 0\n' | run_jail --auto-stop shell
+printf 'if curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 9; fi; exit 0\n' | guest_shell
 printf 'PASS: direct network denied\n'
 
 run_jail recreate
@@ -77,16 +84,17 @@ task_config="$task_repo/tests/config/allowlist.toml"
 cp "$task_config" "$task_tmp/allowlist.toml"
 task_config="$task_tmp/allowlist.toml"
 check_port_forward
-printf 'set -e; curl -fsS --max-time 20 https://example.com >/dev/null; if curl -fsS --max-time 5 https://example.org >/dev/null 2>&1; then exit 9; fi; if HTTPS_PROXY= https_proxy= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 10; fi; exit 0\n' | run_jail shell
+printf 'set -e; curl -fsS --max-time 20 https://example.com >/dev/null; if curl -fsS --max-time 5 https://example.org >/dev/null 2>&1; then exit 9; fi; if HTTPS_PROXY= https_proxy= HTTP_PROXY= http_proxy= ALL_PROXY= all_proxy= curl -fsS --max-time 5 https://example.com >/dev/null 2>&1; then exit 10; fi; exit 0\n' | guest_shell
 run_jail policy log --json | python3 -c 'import json,sys; assert any(e["host"] == "example.org" for e in json.load(sys.stdin))'
 run_jail policy allow example.org
-printf 'set -e; curl -fsS --max-time 20 https://example.org >/dev/null; exit 0\n' | run_jail --auto-stop shell
+printf 'set -e; curl -fsS --max-time 20 https://example.org >/dev/null; exit 0\n' | guest_shell
 printf 'PASS: allowed HTTPS works; forbidden hostname and direct bypass denied\n'
 printf 'PASS: metadata-only denial log and live allowlist adjustment\n'
 
 run_jail recreate
 task_config="$task_repo/tests/config/noshell.toml"
-if run_jail shell; then exit 11; fi
+run_jail codex --version
+if container exec --user root "$(task_container)" /usr/local/bin/jail-guest launch shell </dev/null; then exit 11; fi
 run_jail --auto-stop codex --version
 run_jail --auto-stop claude --version
 task_features="$(run_jail --auto-stop codex features list)"

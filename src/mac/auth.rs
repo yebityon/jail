@@ -188,7 +188,7 @@ pub fn import(
             return Ok(());
         }
         if output.code() != Some(3) {
-            bail!("could not check container authentication; run jail doctor");
+            bail!("could not check container authentication");
         }
     }
     // Capture the marker first; a host refresh during the read is synced later.

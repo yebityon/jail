@@ -65,17 +65,6 @@ elif cmd in ("start", "stop"):
 elif cmd == "delete":
     state = [r for r in state if r["configuration"]["id"] != args[-1]]
     save()
-elif cmd == "stats":
-    time.sleep(float(os.environ.get("JAIL_TEST_STATS_SLEEP", "0")))
-    if "json" in args:
-        print(json.dumps([
-            {"id": r["configuration"]["id"], "cpuUsageUsec": 1000000,
-             "memoryUsageBytes": 128 * 1024 * 1024, "memoryLimitBytes": 256 * 1024 * 1024,
-             "numProcesses": 4}
-            for r in state if r["status"]["state"] == "running"
-        ]))
-    else:
-        print("CPU 0.0%  MEMORY 64MiB")
 elif cmd == "exec":
     if "policy-set" in args:
         (root / "live-policy.json").write_text(sys.stdin.read())
@@ -109,8 +98,6 @@ elif cmd == "exec":
             sys.exit(0)
         time.sleep(float(os.environ.get("JAIL_TEST_SLEEP", "0")))
         sys.exit(int(os.environ.get("JAIL_TEST_EXIT", "0")))
-    if "ps" in args:
-        print("1 0 0 60 0.0 0.1 jail-guest\n10 0 501 30 1.5 3.0 codex\n11 10 501 2 5.0 0.2 git")
 elif cmd == "--version":
     print("container 1.5.0 (test fixture)")
 else:

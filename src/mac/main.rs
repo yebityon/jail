@@ -1,7 +1,6 @@
 mod auth;
 mod backend;
 mod cleanup;
-mod monitor;
 mod policy_cli;
 mod project;
 mod runtime;
@@ -25,7 +24,7 @@ use std::{
 #[command(
     version,
     about = "Run Claude Code / Codex CLI inside Apple containers",
-    after_help = "Examples:\n  jail claude --resume\n  jail codex exec 'run tests'\n  jail --auto-stop claude\n  jail --tail\n  jail --tail --all\n\nPut jail options before claude/codex. Everything after the tool name is forwarded."
+    after_help = "Examples:\n  jail claude --resume\n  jail codex exec 'run tests'\n  jail --auto-stop claude\n\nPut jail options before claude/codex. Everything after the tool name is forwarded."
 )]
 struct Cli {
     #[arg(long, help = "Trusted TOML config (never auto-loads project configs)")]
@@ -37,40 +36,17 @@ struct Cli {
         help = "Show launch plan without starting containers or reading credentials"
     )]
     dry_run: bool,
-    #[arg(long, help = "Live CPU/memory/process dashboard (same as jail tail)")]
-    tail: bool,
-    #[arg(
-        long,
-        requires = "tail",
-        help = "Monitor all jail containers with --tail"
-    )]
-    all: bool,
     #[command(subcommand)]
     command: Option<Action>,
 }
 
 #[derive(Subcommand)]
 enum Action {
-    #[command(about = "Live dashboard; Ctrl+C exits monitoring without stopping containers")]
-    Tail {
-        #[arg(long)]
-        all: bool,
-    },
-    Status {
-        #[arg(long)]
-        watch: bool,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        json: bool,
-    },
-    Ps,
     #[command(about = "Inspect denied destinations and adjust the trusted network allowlist")]
     Policy {
         #[command(subcommand)]
         action: policy_cli::Action,
     },
-    Shell,
     Stop {
         #[arg(long)]
         all: bool,
@@ -81,17 +57,12 @@ enum Action {
         about = "Recreate this project's container; preserves its home volume but removes installed OS packages"
     )]
     Recreate,
-    Doctor,
     Config {
         #[command(subcommand)]
         action: ConfigAction,
     },
     #[command(about = "Explicitly re-import this tool's host login (claude or codex)")]
-    Auth {
-        tool: String,
-    },
-    #[command(about = "Rebuild the configured image; use recreate to switch existing containers")]
-    Update,
+    Auth { tool: String },
     #[command(
         about = "List jail home volumes and images; delete named ones, or all with --all-delete, if no container uses them",
         args_conflicts_with_subcommands = true
@@ -113,7 +84,7 @@ enum ConfigAction {
     Init,
     Show,
 }
-/// How the host process runs a launched agent or shell.
+/// How the host process runs a launched agent.
 enum Session {
     /// Replace jail with the container client.
     Exec,
@@ -166,22 +137,12 @@ fn main() {
     std::process::exit(code);
 }
 fn run(mut cli: Cli) -> Result<i32> {
-    let action = match (cli.tail, cli.command.take()) {
-        (true, None) => Action::Tail { all: cli.all },
-        (true, Some(_)) => bail!(
-            "--tail cannot be combined with a subcommand; use jail --tail in another terminal"
-        ),
-        (false, Some(action)) => action,
-        (false, None) => {
-            use clap::CommandFactory;
-            Cli::command().print_help()?;
-            println!();
-            return Ok(0);
-        }
+    let Some(action) = cli.command.take() else {
+        use clap::CommandFactory;
+        Cli::command().print_help()?;
+        println!();
+        return Ok(0);
     };
-    if matches!(&action, Action::Tail { .. }) && (cli.auto_stop || cli.dry_run) {
-        bail!("tail is read-only monitoring; --auto-stop and --dry-run are not applicable");
-    }
     let path = config_path(&cli, &action)?;
     if let Action::Config {
         action: ConfigAction::Init,
@@ -195,7 +156,7 @@ fn run(mut cli: Cli) -> Result<i32> {
             .write(true)
             .create_new(true)
             .open(&path)?;
-        file.write_all(include_bytes!("../config.example.toml"))?;
+        file.write_all(include_bytes!("../../config.example.toml"))?;
         println!("{}", path.display());
         return Ok(0);
     }
@@ -210,9 +171,6 @@ fn run(mut cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let backend = backend::Backend::new();
-    if matches!(action, Action::Doctor) {
-        return backend.doctor();
-    }
     let data = data_path()?;
     let project = project::Project::discover()?;
     if let Action::Policy { action } = action {
@@ -221,35 +179,26 @@ fn run(mut cli: Cli) -> Result<i32> {
     let mut launch = None;
     // --help and --version run without a login.
     let mut needs_login = true;
-    match &action {
-        Action::Tool(raw) => {
-            let tool = raw
-                .first()
-                .and_then(|s| s.to_str())
-                .context("missing tool")?;
-            let args = raw[1..]
-                .iter()
-                .map(|a| {
-                    a.to_str()
-                        .map(str::to_owned)
-                        .context("arguments must be UTF-8")
-                })
-                .collect::<Result<Vec<_>>>()?;
-            needs_login = !args
-                .iter()
-                .any(|a| ["--help", "-h", "--version", "-V"].contains(&a.as_str()));
-            launch = Some((
-                tool.to_owned(),
-                agent_policy::agent_args(tool, &args, &cfg)?,
-            ));
-        }
-        Action::Shell => {
-            if !cfg.tools.shell {
-                bail!("shell is disabled by tools.shell");
-            }
-            launch = Some(("shell".into(), vec![]));
-        }
-        _ => {}
+    if let Action::Tool(raw) = &action {
+        let tool = raw
+            .first()
+            .and_then(|s| s.to_str())
+            .context("missing tool")?;
+        let args = raw[1..]
+            .iter()
+            .map(|a| {
+                a.to_str()
+                    .map(str::to_owned)
+                    .context("arguments must be UTF-8")
+            })
+            .collect::<Result<Vec<_>>>()?;
+        needs_login = !args
+            .iter()
+            .any(|a| ["--help", "-h", "--version", "-V"].contains(&a.as_str()));
+        launch = Some((
+            tool.to_owned(),
+            agent_policy::agent_args(tool, &args, &cfg)?,
+        ));
     }
     if launch.is_some() || matches!(&action, Action::Auth { .. }) {
         let home = user_home()?.canonicalize().context("cannot resolve HOME")?;
@@ -276,7 +225,7 @@ fn run(mut cli: Cli) -> Result<i32> {
         unsafe { libc::getgid() },
     ))?);
     if cli.dry_run {
-        let (tool, args) = launch.context("--dry-run is supported for claude, codex, and shell")?;
+        let (tool, args) = launch.context("--dry-run is supported for claude and codex")?;
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({
@@ -295,25 +244,6 @@ fn run(mut cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     match action {
-        Action::Tail { all } => return monitor::run(&backend, &data, &project, all),
-        Action::Status { watch, all, json } => {
-            return status(&backend, &data, &project, watch, all, json)
-        }
-        Action::Ps => {
-            let record = project
-                .record(&data)?
-                .context("no container for this project")?;
-            backend.require_owned(&record)?;
-            return backend.interactive(&[
-                "exec",
-                "--user",
-                "root",
-                &record.container,
-                "ps",
-                "-eo",
-                "pid,ppid,user,pcpu,pmem,etime,args",
-            ]);
-        }
         Action::Stop { all, force } => {
             let records = if all {
                 project::records(&data)?
@@ -355,11 +285,6 @@ fn run(mut cli: Cli) -> Result<i32> {
             }
             return Ok(0);
         }
-        Action::Update => {
-            backend.ensure_service()?;
-            runtime::build(&backend, &data, &cfg, true)?;
-            return Ok(0);
-        }
         Action::Cleanup { all_delete, target } => {
             return cleanup::run(target, all_delete, &backend, &data, &project, &image);
         }
@@ -385,7 +310,7 @@ fn run(mut cli: Cli) -> Result<i32> {
         return Ok(0);
     }
     let (tool, agent_args) = launch.context("unsupported command")?;
-    let host_login = tool != "shell" && cfg.auth.import_host && needs_login;
+    let host_login = cfg.auth.import_host && needs_login;
     if host_login {
         auth::import(&backend, &record, &data, &tool, false)?;
     }
@@ -413,14 +338,13 @@ fn run(mut cli: Cli) -> Result<i32> {
     args.extend(agent_args);
     let mut command = backend.command(&args);
     let auto_stop = cli.auto_stop || cfg.lifecycle.auto_stop;
-    let session =
-        if tool != "shell" && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
-            Session::Pty
-        } else if auto_stop || host_login {
-            Session::Wait
-        } else {
-            Session::Exec
-        };
+    let session = if std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        Session::Pty
+    } else if auto_stop || host_login {
+        Session::Wait
+    } else {
+        Session::Exec
+    };
     if let Session::Exec = session {
         // The container client owns the terminal. Retain the shared session lock
         // across exec so stop/recreate cannot race an active client.
@@ -489,83 +413,4 @@ fn wait_with_signals(command: &mut Command) -> Result<i32> {
 fn exit_code(status: ExitStatus) -> i32 {
     use std::os::unix::process::ExitStatusExt;
     status.code().unwrap_or(128 + status.signal().unwrap_or(1))
-}
-fn status(
-    b: &backend::Backend,
-    data: &std::path::Path,
-    project: &project::Project,
-    watch: bool,
-    all: bool,
-    json: bool,
-) -> Result<i32> {
-    if watch && json {
-        bail!("--watch and --json cannot be combined");
-    }
-    let records = if all {
-        project::records(data)?
-    } else {
-        project.record(data)?.into_iter().collect()
-    };
-    if records.is_empty() {
-        if json {
-            println!("[]");
-        } else {
-            println!("no jail containers; run jail claude or jail codex");
-        }
-        return Ok(0);
-    }
-    let mut rows = vec![];
-    let mut running = vec![];
-    for record in records {
-        let state = b.owned_state(&record)?;
-        if state.as_deref() == Some("running") {
-            running.push(record.container.clone());
-        }
-        rows.push(serde_json::json!({ "id": record.container, "project": record.root, "state": state.unwrap_or("missing".into()), "ports": record.ports }));
-    }
-    if json {
-        let stats = if running.is_empty() {
-            serde_json::json!([])
-        } else {
-            let mut args = vec![
-                "stats".into(),
-                "--no-stream".into(),
-                "--format".into(),
-                "json".into(),
-            ];
-            args.extend(running.clone());
-            serde_json::from_slice::<serde_json::Value>(&b.capture(&args)?)?
-        };
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&serde_json::json!({"containers": rows, "stats": stats}))?
-        );
-    } else {
-        for row in rows {
-            println!(
-                "{}  {}  {}",
-                row["id"].as_str().unwrap_or(""),
-                row["state"].as_str().unwrap_or(""),
-                row["project"].as_str().unwrap_or("")
-            );
-            if let Some(ports) = row["ports"].as_array() {
-                for port in ports {
-                    println!(
-                        "  http://127.0.0.1:{} -> container:{} (TCP)",
-                        port["host"], port["container"]
-                    );
-                }
-            }
-        }
-        if !running.is_empty() {
-            let mut args = vec!["stats".into()];
-            if !watch {
-                args.push("--no-stream".into());
-            }
-            args.extend(running);
-            return b.interactive(&args);
-        }
-    }
-    // watch delegates to Apple's live CPU/memory display without polling a service.
-    Ok(0)
 }

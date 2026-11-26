@@ -49,6 +49,25 @@ impl Fixture {
             .map(|s| serde_json::from_str(s).unwrap())
             .collect()
     }
+    /// The saved record of the fixture's only project.
+    fn record(&self) -> Value {
+        let projects = self.tmp.path().join("state/projects");
+        let project = fs::read_dir(projects).unwrap().next().unwrap().unwrap();
+        serde_json::from_slice(&fs::read(project.path().join("record.json")).unwrap()).unwrap()
+    }
+    /// The fake backend's state of one container.
+    fn container(&self, id: &str) -> Value {
+        let state: Value =
+            serde_json::from_slice(&fs::read(self.tmp.path().join("containers.json")).unwrap())
+                .unwrap();
+        state
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["configuration"]["id"] == id)
+            .unwrap()
+            .clone()
+    }
 }
 fn succeeds(output: &Output) {
     assert!(
@@ -447,83 +466,7 @@ fn home_workspace_is_rejected_before_contacting_backend() {
 }
 
 #[test]
-fn tail_alias_and_all_are_read_only_plain_snapshots_when_piped() {
-    let f = Fixture::new();
-    succeeds(&f.run(&["codex", "--version"]));
-    let before = f.calls().len();
-    for args in [
-        vec!["--tail"],
-        vec!["tail"],
-        vec!["--tail", "--all"],
-        vec!["tail", "--all"],
-    ] {
-        let output = f.run(&args);
-        succeeds(&output);
-        let text = String::from_utf8(output.stdout).unwrap();
-        assert!(text.contains("JAIL LIVE"));
-        assert!(text.contains("[RUNNING]"));
-        assert!(text.contains("128.0 MiB / 256.0 MiB (50.0%)"));
-        assert!(text.contains("codex"));
-        assert!(text.contains("git"));
-        assert!(!text.contains("jail-guest"));
-        assert!(!text.contains('\x1b'));
-    }
-    assert!(f.calls()[before..].iter().all(|args| {
-        ["list", "stats", "exec"].contains(&args[0].as_str())
-            && !args
-                .iter()
-                .any(|arg| arg == "launch" || arg == "import-auth")
-    }));
-    succeeds(&f.run(&["stop"]));
-    let output = f.run(&["--tail"]);
-    succeeds(&output);
-    assert!(String::from_utf8_lossy(&output.stdout).contains("[STOPPED]"));
-    assert!(!f.run(&["--tail", "claude"]).status.success());
-    assert!(!f.run(&["--auto-stop", "--tail"]).status.success());
-}
-
-#[test]
-fn tail_redraws_each_second_during_slow_queries_and_restores_terminal() {
-    let f = Fixture::new();
-    succeeds(&f.run(&["codex", "--version"]));
-    let before = f.calls().len();
-    let output = Command::new("python3")
-        .arg(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/tests/fixtures/tail_pty.py"
-        ))
-        .args([
-            env!("CARGO_BIN_EXE_jail"),
-            "--config",
-            f.config.to_str().unwrap(),
-            "--tail",
-        ])
-        .current_dir(f.tmp.path().join("project with spaces"))
-        .env("JAIL_HOME", f.tmp.path().join("state"))
-        .env("JAIL_CONTAINER_BIN", &f.backend)
-        .env("JAIL_TEST_BACKEND", f.tmp.path())
-        .env("JAIL_TEST_STATS_SLEEP", "2.5")
-        .output()
-        .unwrap();
-    succeeds(&output);
-    let result: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(result["code"], 0);
-    assert_eq!(result["restored"], true, "{result}");
-    assert_eq!(result["has_memory"], true);
-    assert_eq!(result["has_process"], true);
-    assert_eq!(result["has_freshness"], true);
-    let frames = result["frames"].as_array().unwrap();
-    assert!(frames.len() >= 4, "{result}");
-    assert_eq!(frames[0], "00:00:00");
-    assert_eq!(frames[1], "00:00:01");
-    assert_eq!(frames[2], "00:00:02");
-    assert!(!f.calls()[before..]
-        .iter()
-        .any(|args| ["start", "stop", "run", "delete"].contains(&args[0].as_str())));
-}
-
-#[test]
-fn reuse_literal_arguments_status_and_exit_code() {
+fn reuse_literal_arguments_and_exit_code() {
     let f = Fixture::new();
     let prompt = "a prompt; $(touch /tmp/jail-should-not-exist) `whoami`";
     succeeds(&f.run(&["codex", "exec", prompt]));
@@ -546,15 +489,10 @@ fn reuse_literal_arguments_status_and_exit_code() {
     assert!(calls
         .iter()
         .any(|a| a.last().map(String::as_str) == Some("--resume")));
-    let status = f.run(&["status", "--json"]);
-    succeeds(&status);
-    let status: Value = serde_json::from_slice(&status.stdout).unwrap();
-    assert_eq!(status["containers"][0]["state"], "running");
-    assert_eq!(status["containers"][0]["id"], *name);
-    assert_eq!(
-        status["containers"][0]["ports"].as_array().unwrap().len(),
-        4
-    );
+    let record = f.record();
+    assert_eq!(record["id"], *name);
+    assert_eq!(record["ports"].as_array().unwrap().len(), 4);
+    assert_eq!(f.container(name)["status"]["state"], "running");
     let output = f
         .command(&["codex", "exec", "hello"])
         .env("JAIL_TEST_EXIT", "19")
@@ -675,17 +613,15 @@ fn occupied_host_port_is_remapped_and_reported_but_not_silently_changed_on_resta
         format!("[auth]\nimport_host=false\n[network]\npublished_ports=[{requested}]\n"),
     )
     .unwrap();
-    succeeds(&f.run(&["codex", "--version"]));
-    let output = f.run(&["status", "--json"]);
+    let output = f.run(&["codex", "--version"]);
     succeeds(&output);
-    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
-    let port = &status["containers"][0]["ports"][0];
+    let port = &f.record()["ports"][0];
     assert_eq!(port["container"], requested);
     let assigned = port["host"].as_u64().unwrap() as u16;
     assert_ne!(assigned, requested);
-    let tail = f.run(&["--tail"]);
-    succeeds(&tail);
-    assert!(String::from_utf8_lossy(&tail.stdout).contains(&format!("http://127.0.0.1:{assigned}")));
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains(&format!("http://127.0.0.1:{assigned}"))
+    );
     succeeds(&f.run(&["stop"]));
     let conflict = TcpListener::bind(("127.0.0.1", assigned)).unwrap();
     let output = f.run(&["claude", "--version"]);
@@ -761,12 +697,8 @@ fn legacy_names_use_stable_metadata_and_session_locks() {
     state[0]["configuration"]["id"] = key.into();
     fs::write(containers, serde_json::to_vec(&state).unwrap()).unwrap();
     succeeds(&f.run(&["claude", "--version"]));
-    succeeds(&f.run(&["--tail"]));
     succeeds(&f.run(&["stop", "--all"]));
     assert_eq!(f.calls().iter().filter(|a| a[0] == "run").count(), 1);
-    let output = f.run(&["status", "--json"]);
-    succeeds(&output);
-    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
-    assert_eq!(status["containers"][0]["id"], key);
-    assert_eq!(status["containers"][0]["state"], "stopped");
+    assert_eq!(f.record()["id"], key);
+    assert_eq!(f.container(key)["status"]["state"], "stopped");
 }
