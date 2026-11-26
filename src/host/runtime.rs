@@ -18,7 +18,7 @@ use std::{
 const FILES: &[(&str, &str)] = &[
     ("Cargo.toml", include_str!("../../Cargo.toml")),
     ("Cargo.lock", include_str!("../../Cargo.lock")),
-    ("src/mac/main.rs", "fn main() {}\n"),
+    ("src/host/main.rs", "fn main() {}\n"),
     ("src/shared/lib.rs", include_str!("../shared/lib.rs")),
     ("src/shared/config.rs", include_str!("../shared/config.rs")),
     (
