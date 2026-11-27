@@ -1,0 +1,5 @@
+# The same release as the jail-guest builder in container/Dockerfile.
+[toolchain]
+channel = "1.85.1"
+components = ["clippy", "rustfmt"]
+profile = "minimal"

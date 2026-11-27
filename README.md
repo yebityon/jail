@@ -417,6 +417,14 @@ cargo build --locked --release --bin jail
 
 Integration tests use a Python Apple-container fake and temporary loopback listeners. They do not contact the real container service or import host credentials.
 
+CI runs these checks on macOS. It also runs Clippy and the tests of the library and the `jail-guest` supervisor on arm64 Linux, the only place where code under `cfg(target_os = "linux")` compiles. [rust-toolchain.toml](rust-toolchain.toml) pins the Rust release that `container/Dockerfile` builds `jail-guest` with.
+
+Fuzz targets for the parsers that read agent input are in [fuzz](fuzz). They need nightly Rust and [cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz), and do not run in CI:
+
+```sh
+cargo +nightly fuzz run gateway_request   # or proxy_request, base64
+```
+
 Optional real-container checks, after building the release binary:
 
 ```sh

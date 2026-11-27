@@ -156,21 +156,28 @@ fn sanitize(tool: &str, bytes: &[u8]) -> Result<Vec<u8>> {
     jail::gateway::token(tool, &Value::Object(out.clone()))?;
     Ok(serde_json::to_vec(&out)?)
 }
-/// Loads the host login into the container's gateway. `explicit` is set by
-/// `jail auth`: it replaces a login the container already has and fails when
-/// the host has none. A launch keeps an existing login, and on a terminal it
-/// only warns about a missing one.
+/// How `import` treats a login that the container already has.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Import {
+    /// `jail auth`: replaces the container's login and fails when the host
+    /// has none.
+    Replace,
+    /// A launch: keeps an existing login, and on a terminal only warns about
+    /// a missing one.
+    IfMissing,
+}
+/// Loads the host login into the container's gateway.
 pub fn import(
     client: &Client,
     record: &Record,
     data: &Path,
     tool: &str,
-    explicit: bool,
+    mode: Import,
 ) -> Result<()> {
     if !["claude", "codex"].contains(&tool) {
         bail!("auth tool must be claude or codex");
     }
-    if !explicit {
+    if mode == Import::IfMissing {
         let output = client
             .exec(&record.container)
             .user("root")
@@ -190,7 +197,10 @@ pub fn import(
     let fingerprint = fingerprint(tool)?;
     let credentials = host_credentials(tool)?;
     let Some(bytes) = credentials else {
-        if !explicit && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() {
+        if mode == Import::IfMissing
+            && std::io::stdin().is_terminal()
+            && std::io::stdout().is_terminal()
+        {
             eprintln!(
                 "jail: no host login found; run `{}` on the Mac and this session receives it within about 15 seconds",
                 host_login_command(tool)

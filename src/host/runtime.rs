@@ -2,6 +2,7 @@ use crate::{
     apple_container::{Client, Run},
     backend::{self, PROJECT_LABEL},
     project::{self, Port, Project, Record},
+    sys,
 };
 use anyhow::{bail, Context, Result};
 use fs2::FileExt;
@@ -22,6 +23,7 @@ const FILES: &[(&str, &str)] = &[
     ("src/host/main.rs", "fn main() {}\n"),
     ("src/shared/lib.rs", include_str!("../shared/lib.rs")),
     ("src/shared/config.rs", include_str!("../shared/config.rs")),
+    ("src/shared/guard.rs", include_str!("../shared/guard.rs")),
     (
         "src/shared/agent_policy.rs",
         include_str!("../shared/agent_policy.rs"),
@@ -42,6 +44,7 @@ const FILES: &[(&str, &str)] = &[
         "src/container/main.rs",
         include_str!("../container/main.rs"),
     ),
+    ("src/container/sys.rs", include_str!("../container/sys.rs")),
     ("Dockerfile", include_str!("../../container/Dockerfile")),
 ];
 /// Label marking a container that jail deletes when its session ends.
@@ -57,8 +60,8 @@ pub fn image_tag(cfg: &Config) -> String {
         "{}:{}:{}:{}",
         cfg.image.claude_version,
         cfg.image.codex_version,
-        unsafe { libc::getuid() },
-        unsafe { libc::getgid() }
+        sys::uid(),
+        sys::gid()
     );
     for (path, content) in FILES {
         material.push_str(path);
@@ -77,11 +80,11 @@ pub fn image_name(name: &str) -> Option<&str> {
 pub fn build_context(data: &Path, image: &str) -> PathBuf {
     data.join("build").join(image.replace(':', "-"))
 }
-pub fn build(client: &Client, data: &Path, cfg: &Config, force: bool) -> Result<String> {
+pub fn build(client: &Client, data: &Path, cfg: &Config) -> Result<String> {
     let image = image_tag(cfg);
     let image_build = project::global_lock(data, "image-build")?;
     FileExt::lock_exclusive(&image_build)?;
-    if !force && client.image_exists(&image) {
+    if client.image_exists(&image) {
         return Ok(image);
     }
     let context = build_context(data, &image);
@@ -99,10 +102,9 @@ pub fn build(client: &Client, data: &Path, cfg: &Config, force: bool) -> Result<
         &[
             ("CLAUDE_VERSION", cfg.image.claude_version.to_string()),
             ("CODEX_VERSION", cfg.image.codex_version.to_string()),
-            ("JAIL_UID", unsafe { libc::getuid() }.to_string()),
-            ("JAIL_GID", unsafe { libc::getgid() }.to_string()),
+            ("JAIL_UID", sys::uid().to_string()),
+            ("JAIL_GID", sys::gid().to_string()),
         ],
-        force,
         &context,
     )?;
     Ok(image)
@@ -136,7 +138,7 @@ pub fn ensure(
             return Ok(record.clone());
         }
     }
-    build(client, data, cfg, false)?;
+    build(client, data, cfg)?;
     // Serialize jail's port selection and creation across different projects.
     // Other host apps can still race the final bind; the backend must fail safely.
     let port_allocation = project::global_lock(data, "port-allocation")?;
@@ -209,7 +211,7 @@ pub fn ensure(
             .volume(volume, "/home/jail");
     }
     run.env("JAIL_CONFIG_JSON", &serde_json::to_string(cfg)?)
-        .env("JAIL_WRITE_GUARD", &serde_json::to_string(&guard)?);
+        .env(jail::guard::ENV, &serde_json::to_string(&guard)?);
     if !project.ephemeral {
         for mount in &cfg.workspace.mounts {
             run.bind(&mount.source, &mount.target, mount.read_only || read_only);

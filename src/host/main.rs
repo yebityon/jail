@@ -5,6 +5,7 @@ mod cleanup;
 mod policy_cli;
 mod project;
 mod runtime;
+mod sys;
 mod terminal;
 mod write_guard;
 
@@ -16,7 +17,7 @@ use std::{
     ffi::OsString,
     fs,
     io::{IsTerminal, Write},
-    os::unix::{io::AsRawFd, process::CommandExt},
+    os::{fd::AsFd, unix::process::CommandExt},
     path::PathBuf,
     process::{Command, ExitStatus},
 };
@@ -234,8 +235,8 @@ fn run(mut cli: Cli) -> Result<i32> {
         runtime::revision(),
         &project.root,
         &image,
-        unsafe { libc::getuid() },
-        unsafe { libc::getgid() },
+        sys::uid(),
+        sys::gid(),
     ))?);
     if cli.dry_run {
         let (tool, args) = launch.context("--dry-run is supported for claude and codex")?;
@@ -328,13 +329,13 @@ fn run(mut cli: Cli) -> Result<i32> {
     if let Action::Auth { tool } = &action {
         FileExt::try_lock_exclusive(&sessions)
             .context("close active sessions before re-importing authentication")?;
-        auth::import(&client, &record, &data, tool, true)?;
+        auth::import(&client, &record, &data, tool, auth::Import::Replace)?;
         return Ok(0);
     }
     let (tool, agent_args) = launch.context("unsupported command")?;
     let host_login = cfg.auth.import_host && needs_login;
     if host_login {
-        auth::import(&client, &record, &data, &tool, false)?;
+        auth::import(&client, &record, &data, &tool, auth::Import::IfMissing)?;
     }
     drop(lifecycle);
     let mut exec = client.exec(&record.container);
@@ -364,13 +365,7 @@ fn run(mut cli: Cli) -> Result<i32> {
     if let Session::Exec = session {
         // The container client owns the terminal. Retain the shared session lock
         // across exec so stop/recreate cannot race an active client.
-        let fd = sessions.as_raw_fd();
-        unsafe {
-            let flags = libc::fcntl(fd, libc::F_GETFD);
-            if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
+        sys::inherit_on_exec(sessions.as_fd())?;
         return Err(command.exec().into());
     }
     // The host process stays alive for the session so host refreshes reach it.
@@ -424,16 +419,14 @@ fn wait_with_signals(command: &mut Command) -> Result<i32> {
     let mut signals = SignalsInfo::<WithOrigin>::new([SIGHUP, SIGINT, SIGTERM, SIGWINCH])?;
     let handle = signals.handle();
     let mut child = command.spawn()?;
-    let pid = child.id() as i32;
+    let pid = sys::Pid::of(&child)?;
     let thread = std::thread::spawn(move || {
         for origin in signals.forever() {
             // The terminal already sends keyboard/resize signals to both
             // processes in the foreground group. Forward only process-origin
             // signals, so a single Ctrl+C is never delivered twice.
             if origin.process.is_some_and(|process| process.pid > 0) {
-                unsafe {
-                    libc::kill(pid, origin.signal);
-                }
+                let _ = pid.signal(origin.signal);
             }
         }
     });

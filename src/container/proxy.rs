@@ -72,6 +72,48 @@ pub fn public_ip(ip: IpAddr) -> bool {
     }
 }
 
+/// One of a bounded number of concurrent connections. Dropping it frees the
+/// slot, also when a connection's thread panics.
+pub(crate) struct Slot(Arc<AtomicUsize>);
+impl Slot {
+    pub(crate) fn take(active: &Arc<AtomicUsize>, limit: usize) -> Option<Self> {
+        if active.fetch_add(1, Ordering::SeqCst) >= limit {
+            active.fetch_sub(1, Ordering::SeqCst);
+            return None;
+        }
+        Some(Self(active.clone()))
+    }
+}
+impl Drop for Slot {
+    fn drop(&mut self) {
+        self.0.fetch_sub(1, Ordering::SeqCst);
+    }
+}
+
+/// What a request head asks the proxy for.
+#[derive(Debug, PartialEq)]
+pub(crate) enum Request<'a> {
+    Connect {
+        host: &'a str,
+        port: u16,
+    },
+    /// A response status for anything else.
+    Reject(u16),
+}
+pub(crate) fn parse_request(head: &[u8]) -> Result<Request<'_>> {
+    let request = std::str::from_utf8(head).context("invalid request")?;
+    let mut parts = request.lines().next().unwrap_or("").split_whitespace();
+    if parts.next() != Some("CONNECT") {
+        return Ok(Request::Reject(405));
+    }
+    let authority = parts.next().unwrap_or("");
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return Ok(Request::Reject(400));
+    };
+    // An invalid port becomes 0, which the policy denies and records.
+    let port = port.parse::<u16>().unwrap_or(0);
+    Ok(Request::Connect { host, port })
+}
 fn handle(mut client: TcpStream, _original: &Network) -> Result<()> {
     client.set_read_timeout(Some(Duration::from_secs(15)))?;
     client.set_write_timeout(Some(Duration::from_secs(15)))?;
@@ -84,18 +126,13 @@ fn handle(mut client: TcpStream, _original: &Network) -> Result<()> {
         }
         header.push(byte[0]);
     }
-    let request = String::from_utf8(header).context("invalid request")?;
-    let mut parts = request.lines().next().unwrap_or("").split_whitespace();
-    if parts.next() != Some("CONNECT") {
-        reject(&mut client, 405)?;
-        return Ok(());
-    }
-    let authority = parts.next().unwrap_or("");
-    let Some((host, port)) = authority.rsplit_once(':') else {
-        reject(&mut client, 400)?;
-        return Ok(());
+    let (host, port) = match parse_request(&header)? {
+        Request::Connect { host, port } => (host, port),
+        Request::Reject(code) => {
+            reject(&mut client, code)?;
+            return Ok(());
+        }
     };
-    let port = port.parse::<u16>().unwrap_or(0);
     let policy = crate::network_policy::load()?;
     if !crate::network_policy::permits(&policy, host, port) {
         crate::network_policy::deny(host, port, "allowlist")?;
@@ -147,17 +184,15 @@ pub fn serve(listener: TcpListener, policy: Network) -> Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     for client in listener.incoming() {
         let client = client?;
-        if active.fetch_add(1, Ordering::SeqCst) >= 128 {
-            active.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = Slot::take(&active, 128) else {
             drop(client);
             continue;
-        }
+        };
         let policy = policy.clone();
-        let active = active.clone();
         thread::spawn(move || {
+            let _slot = slot;
             // Never log headers, credentials, URLs, or payloads.
             let _ = handle(client, &policy);
-            active.fetch_sub(1, Ordering::SeqCst);
         });
     }
     bail!("proxy listener stopped")
@@ -180,6 +215,50 @@ mod tests {
         ] {
             assert!(!host_allowed(h, &rules), "{h}");
         }
+    }
+    #[test]
+    fn only_connect_with_a_port_is_forwarded() {
+        fn parse(head: &[u8]) -> Request<'_> {
+            parse_request(head).unwrap()
+        }
+        assert_eq!(
+            parse(b"CONNECT api.anthropic.com:443 HTTP/1.1\r\n\r\n"),
+            Request::Connect {
+                host: "api.anthropic.com",
+                port: 443
+            }
+        );
+        assert_eq!(
+            parse(b"GET http://evil.test/ HTTP/1.1\r\n\r\n"),
+            Request::Reject(405)
+        );
+        assert_eq!(
+            parse(b"CONNECT evil.test HTTP/1.1\r\n\r\n"),
+            Request::Reject(400)
+        );
+        assert_eq!(
+            parse(b"CONNECT evil.test:99999 HTTP/1.1\r\n\r\n"),
+            Request::Connect {
+                host: "evil.test",
+                port: 0
+            }
+        );
+        assert!(parse_request(b"CONNECT \xff:443 HTTP/1.1\r\n\r\n").is_err());
+    }
+    #[test]
+    fn a_panicking_connection_frees_its_slot() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let first = Slot::take(&active, 2).unwrap();
+        let second = Slot::take(&active, 2).unwrap();
+        assert!(Slot::take(&active, 2).is_none());
+        drop(first);
+        let panicked = thread::spawn(move || {
+            let _slot = second;
+            panic!("connection failed");
+        })
+        .join();
+        assert!(panicked.is_err());
+        assert_eq!(active.load(Ordering::SeqCst), 0);
     }
     #[test]
     fn internal_destinations_are_denied() {

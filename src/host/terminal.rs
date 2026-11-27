@@ -1,14 +1,11 @@
 //! Host-side PTY mediation. A typed /login is answered by jail and never reaches
 //! the agent CLI: sign-in happens only on the Mac.
+use crate::sys;
 use anyhow::{Context, Result};
 use signal_hook::consts::signal::{SIGHUP, SIGINT, SIGTERM};
 use std::{
-    fs::File,
     io::{Read, Write},
-    os::unix::{
-        io::{AsRawFd, FromRawFd},
-        process::CommandExt,
-    },
+    os::fd::{AsFd, AsRawFd},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -19,25 +16,16 @@ use std::{
 struct Terminal(libc::termios);
 impl Terminal {
     fn new() -> Result<Self> {
-        let mut saved = unsafe { std::mem::zeroed() };
-        if unsafe { libc::tcgetattr(0, &mut saved) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(Self(saved))
+        Ok(Self(sys::terminal_mode(std::io::stdin().as_fd())?))
     }
     fn raw(&self) -> Result<()> {
-        let mut mode = self.0;
-        unsafe { libc::cfmakeraw(&mut mode) };
-        self.set(&mode)
+        self.set(&sys::raw_mode(self.0))
     }
     fn restore(&self) -> Result<()> {
         self.set(&self.0)
     }
     fn set(&self, mode: &libc::termios) -> Result<()> {
-        if unsafe { libc::tcsetattr(0, libc::TCSANOW, mode) } != 0 {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(())
+        Ok(sys::set_terminal_mode(std::io::stdin().as_fd(), mode)?)
     }
 }
 impl Drop for Terminal {
@@ -127,48 +115,21 @@ impl Drop for Child {
 
 pub fn run(command: &mut Command, mut login: impl FnMut() -> Result<()>) -> Result<i32> {
     let terminal = Terminal::new()?;
-    let mut master = -1;
-    let mut slave = -1;
-    let mut size: libc::winsize = unsafe { std::mem::zeroed() };
-    let mut slave_mode = terminal.0;
-    unsafe {
-        libc::ioctl(0, libc::TIOCGWINSZ, &mut size);
-    }
-    if unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            &mut slave_mode,
-            &mut size,
-        )
-    } != 0
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    let mut master = unsafe { File::from_raw_fd(master) };
-    let slave = unsafe { File::from_raw_fd(slave) };
+    let mut size = sys::window_size(std::io::stdin().as_fd());
+    let (mut master, slave) = sys::open_pty(&terminal.0, &size)?;
     // Do not leak the master into either the container client or OAuth CLI.
-    unsafe {
-        libc::fcntl(master.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC);
-    }
+    let _ = sys::close_on_exec(master.as_fd());
     command
         .stdin(Stdio::from(slave.try_clone()?))
         .stdout(Stdio::from(slave.try_clone()?))
         .stderr(Stdio::from(slave));
-    unsafe {
-        command.pre_exec(|| {
-            if libc::setsid() < 0 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
-    }
+    sys::controlling_terminal(command);
     let mut child = Child(
         command
             .spawn()
             .context("could not start interactive container client")?,
     );
+    let pid = sys::Pid::of(&child.0)?;
     let stop = Arc::new(AtomicBool::new(false));
     let interrupt = Arc::new(AtomicBool::new(false));
     let mut handlers = Vec::new();
@@ -194,20 +155,13 @@ pub fn run(command: &mut Command, mut login: impl FnMut() -> Result<()>) -> Resu
             master.write_all(&[3])?;
         }
         if stop.load(Ordering::Relaxed) {
-            unsafe {
-                libc::kill(-(child.0.id() as i32), SIGTERM);
-            }
+            let _ = pid.signal_group(SIGTERM);
             return Ok(130);
         }
-        let mut new_size: libc::winsize = unsafe { std::mem::zeroed() };
-        unsafe {
-            libc::ioctl(0, libc::TIOCGWINSZ, &mut new_size);
-        }
+        let new_size = sys::window_size(std::io::stdin().as_fd());
         if (size.ws_col, size.ws_row) != (new_size.ws_col, new_size.ws_row) {
             size = new_size;
-            unsafe {
-                libc::ioctl(master.as_raw_fd(), libc::TIOCSWINSZ, &size);
-            }
+            let _ = sys::set_window_size(master.as_fd(), &size);
         }
         let mut polls = [
             libc::pollfd {
@@ -221,12 +175,11 @@ pub fn run(command: &mut Command, mut login: impl FnMut() -> Result<()>) -> Resu
                 revents: 0,
             },
         ];
-        let ready = unsafe { libc::poll(polls.as_mut_ptr(), 2, 100) };
-        if ready < 0 {
-            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+        if let Err(e) = sys::poll(&mut polls, 100) {
+            if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            return Err(std::io::Error::last_os_error().into());
+            return Err(e.into());
         }
         if polls[1].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
             match master.read(&mut buffer) {
