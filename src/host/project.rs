@@ -94,11 +94,10 @@ const EPHEMERAL_ROOT: &str = "/ephemeral";
 /// `jail-<slug>-` followed by the local creation time, down to microseconds.
 fn timestamped(slug: &str) -> Result<String> {
     let now = SystemTime::now().duration_since(UNIX_EPOCH)?;
-    let seconds = now.as_secs() as libc::time_t;
-    let mut date: libc::tm = unsafe { std::mem::zeroed() };
-    if unsafe { libc::localtime_r(&seconds, &mut date) }.is_null() {
+    let seconds = libc::time_t::try_from(now.as_secs())?;
+    let Some(date) = crate::sys::local_time(seconds) else {
         bail!("cannot format container creation time");
-    }
+    };
     Ok(format!(
         "jail-{slug}-{:04}{:02}{:02}-{:02}{:02}{:02}-{:06}",
         date.tm_year + 1900,

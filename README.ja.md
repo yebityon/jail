@@ -417,6 +417,14 @@ cargo build --locked --release --bin jail
 
 統合テストはPython製のApple container代替と一時的なloopbackリスナーを使います。実際のcontainerサービスには接続せず、ホスト認証も取り込みません。
 
+CIはmacOSで上記を実行します。arm64 Linuxでは、ライブラリと`jail-guest`監督プロセスのClippyとテストを実行します。`cfg(target_os = "linux")`のコードは、Linuxでだけコンパイルされます。[rust-toolchain.toml](rust-toolchain.toml)は、`container/Dockerfile`が`jail-guest`のビルドに使うRustのリリースに固定します。
+
+エージェントからの入力を読むパーサーのファズターゲットは[fuzz](fuzz)にあります。nightlyのRustと[cargo-fuzz](https://github.com/rust-fuzz/cargo-fuzz)が必要です。CIでは実行しません。
+
+```sh
+cargo +nightly fuzz run gateway_request   # proxy_request、base64も同様
+```
+
 releaseバイナリをビルドした後、必要に応じて実コンテナで検証できます。
 
 ```sh

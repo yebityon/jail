@@ -15,6 +15,7 @@ use std::{
         atomic::{AtomicUsize, Ordering},
         Arc,
     },
+    thread,
     time::Duration,
 };
 
@@ -129,7 +130,7 @@ fn store(tool: &str, value: &Value) -> Result<()> {
     drop(cleanup);
     Ok(())
 }
-fn base64(bytes: &[u8]) -> String {
+pub(crate) fn base64(bytes: &[u8]) -> String {
     let alphabet = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
     let mut out = String::new();
     for part in bytes.chunks(3) {
@@ -147,7 +148,7 @@ fn base64(bytes: &[u8]) -> String {
     }
     out
 }
-fn decode(text: &str) -> Option<Vec<u8>> {
+pub(crate) fn decode(text: &str) -> Option<Vec<u8>> {
     let mut bits = 0u32;
     let mut count = 0;
     let mut out = vec![];
@@ -197,7 +198,7 @@ pub fn placeholder(tool: &str, real: &Value) -> Value {
             "last_refresh":"2099-01-01T00:00:00Z"})
     }
 }
-fn upstream(tool: &str, method: &str, path: &str) -> Result<(&'static str, String)> {
+pub(crate) fn upstream(tool: &str, method: &str, path: &str) -> Result<(&'static str, String)> {
     if !["GET", "POST"].contains(&method)
         || !path.starts_with('/')
         || path.contains(['\r', '\n', '\\', '#'])
@@ -245,48 +246,31 @@ impl Drop for Curl {
 fn quoted(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
 }
-fn handle(mut client: TcpStream, tool: &str) -> Result<()> {
-    client.set_read_timeout(Some(Duration::from_secs(30)))?;
-    client.set_write_timeout(Some(Duration::from_secs(30)))?;
-    let mut reader = BufReader::new(client.try_clone()?);
-    let mut header = vec![];
-    // Strict bounded parser: no ambiguous CL/TE, no pipelining or upgrades.
-    while !header.ends_with(b"\r\n\r\n") && header.len() < 32_768 {
-        let mut byte = [0];
-        reader.read_exact(&mut byte)?;
-        header.push(byte[0]);
-    }
-    if !header.ends_with(b"\r\n\r\n") {
-        bail!("header too large");
-    }
-    let header = String::from_utf8(header)?;
-    let mut lines = header.split("\r\n");
-    let parts: Vec<_> = lines.next().unwrap_or("").split_whitespace().collect();
+/// A request head, read through its blank line.
+pub(crate) struct Head<'a> {
+    pub(crate) method: &'a str,
+    pub(crate) path: &'a str,
+    /// The header lines.
+    pub(crate) fields: &'a str,
+}
+pub(crate) fn parse_head(head: &[u8]) -> Result<Head<'_>> {
+    let head = std::str::from_utf8(head)?;
+    let (line, fields) = head.split_once("\r\n").context("invalid request")?;
+    let parts: Vec<_> = line.split_whitespace().collect();
     if parts.len() != 3 || !["HTTP/1.1", "HTTP/1.0"].contains(&parts[2]) {
         bail!("invalid request");
     }
-    let (host, url) = upstream(tool, parts[0], parts[1])?;
-    let policy = network_policy::load()?;
-    if !network_policy::permits(&policy, host, 443) {
-        network_policy::deny(host, 443, "auth_gateway_allowlist")?;
-        client.write_all(
-            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-        )?;
-        return Ok(());
-    }
-    let credentials: Value = match fs::read(credential_path(tool)?) {
-        Ok(bytes) => serde_json::from_slice(&bytes)?,
-        Err(_) => {
-            client.write_all(
-                b"HTTP/1.1 503 Login Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
-            )?;
-            return Ok(());
-        }
-    };
-    let secret = token(tool, &credentials)?;
+    Ok(Head {
+        method: parts[0],
+        path: parts[1],
+        fields,
+    })
+}
+/// The body length and the headers to forward upstream.
+pub(crate) fn forwarded(fields: &str) -> Result<(u64, Vec<String>)> {
     let mut length = None;
     let mut headers = vec![];
-    for line in lines.filter(|l| !l.is_empty()) {
+    for line in fields.split("\r\n").filter(|l| !l.is_empty()) {
         let (key, value) = line.split_once(':').context("invalid header")?;
         let key = key.to_ascii_lowercase();
         let value = value.trim();
@@ -302,7 +286,7 @@ fn handle(mut client: TcpStream, tool: &str) -> Result<()> {
                 if length.is_some() {
                     bail!("duplicate content length");
                 }
-                length = Some(value.parse::<usize>()?);
+                length = Some(value.parse::<u64>()?);
             }
             "transfer-encoding" | "upgrade" | "expect" => {
                 bail!("unsupported transfer encoding or upgrade")
@@ -324,6 +308,43 @@ fn handle(mut client: TcpStream, tool: &str) -> Result<()> {
     if length > 64 * 1024 * 1024 {
         bail!("request too large");
     }
+    Ok((length, headers))
+}
+fn handle(client: &mut TcpStream, tool: &str) -> Result<()> {
+    client.set_read_timeout(Some(Duration::from_secs(30)))?;
+    client.set_write_timeout(Some(Duration::from_secs(30)))?;
+    let mut reader = BufReader::new(client.try_clone()?);
+    let mut header = vec![];
+    // Strict bounded parser: no ambiguous CL/TE, no pipelining or upgrades.
+    while !header.ends_with(b"\r\n\r\n") && header.len() < 32_768 {
+        let mut byte = [0];
+        reader.read_exact(&mut byte)?;
+        header.push(byte[0]);
+    }
+    if !header.ends_with(b"\r\n\r\n") {
+        bail!("header too large");
+    }
+    let head = parse_head(&header)?;
+    let (host, url) = upstream(tool, head.method, head.path)?;
+    let policy = network_policy::load()?;
+    if !network_policy::permits(&policy, host, 443) {
+        network_policy::deny(host, 443, "auth_gateway_allowlist")?;
+        client.write_all(
+            b"HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+        )?;
+        return Ok(());
+    }
+    let credentials: Value = match fs::read(credential_path(tool)?) {
+        Ok(bytes) => serde_json::from_slice(&bytes)?,
+        Err(_) => {
+            client.write_all(
+                b"HTTP/1.1 503 Login Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            )?;
+            return Ok(());
+        }
+    };
+    let secret = token(tool, &credentials)?;
+    let (length, mut headers) = forwarded(head.fields)?;
     let id = REQUEST.fetch_add(1, Ordering::Relaxed);
     let body = BodyFile(PathBuf::from(PRIVATE).join(format!("body-{}-{id}", std::process::id())));
     let mut file = fs::OpenOptions::new()
@@ -332,8 +353,8 @@ fn handle(mut client: TcpStream, tool: &str) -> Result<()> {
         .mode(0o600)
         .custom_flags(libc::O_NOFOLLOW)
         .open(&body.0)?;
-    let copied = std::io::copy(&mut reader.take(length as u64), &mut file)?;
-    if copied != length as u64 {
+    let copied = std::io::copy(&mut reader.take(length), &mut file)?;
+    if copied != length {
         bail!("incomplete body");
     }
     drop(file);
@@ -355,7 +376,7 @@ fn handle(mut client: TcpStream, tool: &str) -> Result<()> {
     let mut cfg = format!(
         "url = {}\nrequest = {}\nresolve = {}\nheader = {}\n",
         quoted(&url),
-        quoted(parts[0]),
+        quoted(head.method),
         quoted(&resolve),
         quoted(&format!("Authorization: Bearer {secret}"))
     );
@@ -373,7 +394,7 @@ fn handle(mut client: TcpStream, tool: &str) -> Result<()> {
     for h in headers {
         cfg.push_str(&format!("header = {}\n", quoted(&h)));
     }
-    if parts[0] == "POST" {
+    if head.method == "POST" {
         cfg.push_str(&format!(
             "data-binary = {}\n",
             quoted(&format!("@{}", body.0.display()))
@@ -458,18 +479,16 @@ pub fn serve(listener: TcpListener, tool: &'static str) -> Result<()> {
     let active = Arc::new(AtomicUsize::new(0));
     for client in listener.incoming() {
         let mut client = client?;
-        if active.fetch_add(1, Ordering::SeqCst) >= 64 {
-            active.fetch_sub(1, Ordering::SeqCst);
+        let Some(slot) = proxy::Slot::take(&active, 64) else {
             continue;
-        }
-        let active = active.clone();
-        std::thread::spawn(move || {
-            if handle(client.try_clone().unwrap(), tool).is_err() {
+        };
+        thread::spawn(move || {
+            let _slot = slot;
+            if handle(&mut client, tool).is_err() {
                 let _ = client.write_all(
                     b"HTTP/1.1 502 Gateway Error\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
                 );
             }
-            active.fetch_sub(1, Ordering::SeqCst);
         });
     }
     bail!("authentication gateway stopped")
@@ -526,6 +545,37 @@ mod tests {
         }
         assert!(upstream("claude", "CONNECT", "/v1/messages").is_err());
         assert_eq!(base64(b"hello"), "aGVsbG8");
+    }
+    #[test]
+    fn request_heads_are_parsed_strictly() {
+        let head = parse_head(b"POST /v1/messages HTTP/1.1\r\nContent-Length: 2\r\n\r\n").unwrap();
+        assert_eq!((head.method, head.path), ("POST", "/v1/messages"));
+        assert_eq!(forwarded(head.fields).unwrap().0, 2);
+        for head in [
+            b"POST /v1/messages\r\n\r\n".as_slice(),
+            b"POST /v1/messages HTTP/2\r\n\r\n",
+            b"POST /v1/messages HTTP/1.1 extra\r\n\r\n",
+            b"\xff /v1/messages HTTP/1.1\r\n\r\n",
+        ] {
+            assert!(parse_head(head).is_err());
+        }
+        let (length, headers) = forwarded(
+            "Authorization: Bearer agent\r\nAccept: text/event-stream\r\nX-Forwarded-Host: evil.test\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(length, 0);
+        assert_eq!(headers, ["accept: text/event-stream"]);
+        for fields in [
+            "Content-Length: 1\r\nContent-Length: 1\r\n",
+            "Transfer-Encoding: chunked\r\n",
+            "Content-Length: 67108865\r\n",
+            "Content-Length: -1\r\n",
+            "Accept text/plain\r\n",
+            "Bad Key: x\r\n",
+            "Accept: a\x7fb\r\n",
+        ] {
+            assert!(forwarded(fields).is_err(), "{fields:?}");
+        }
     }
     #[test]
     fn sync_keeps_the_later_login() {

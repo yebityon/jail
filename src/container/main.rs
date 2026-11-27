@@ -1,4 +1,6 @@
 //! Trusted Linux-side supervisor. The user-facing CLI is the `jail` binary.
+mod sys;
+
 use anyhow::{bail, Context, Result};
 use jail::{
     agent_policy,
@@ -79,15 +81,8 @@ fn secure_write(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(mode))?;
     Ok(())
 }
-fn chown(path: &Path, uid: u32, gid: u32) -> Result<()> {
-    let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-    if unsafe { libc::chown(path.as_ptr(), uid, gid) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
-}
 fn init() -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !sys::is_root() {
         bail!("supervisor must start as root");
     }
     let c: Config = serde_json::from_str(&std::env::var("JAIL_CONFIG_JSON")?)?;
@@ -105,7 +100,7 @@ fn init() -> Result<()> {
             }
         }
         fs::create_dir_all(dir)?;
-        chown(Path::new(dir), uid, gid)?;
+        sys::chown(Path::new(dir), uid, gid)?;
         fs::set_permissions(dir, fs::Permissions::from_mode(0o700))?;
     }
     let claude = serde_json::to_vec(&agent_policy::claude_settings(&c))?;
@@ -124,7 +119,7 @@ fn init() -> Result<()> {
     let onboarding = Path::new("/home/jail/.claude.json");
     if !onboarding.exists() {
         secure_write(onboarding, br#"{"hasCompletedOnboarding":true}"#, 0o600)?;
-        chown(onboarding, uid, gid)?;
+        sys::chown(onboarding, uid, gid)?;
     }
     // Migrate known legacy credential files as the agent, never root-write into
     // agent-owned home paths. Real credentials live only in root-owned tmpfs.
@@ -163,114 +158,31 @@ fn init() -> Result<()> {
 }
 #[cfg(target_os = "linux")]
 fn protect_paths() -> Result<()> {
-    #[derive(serde::Deserialize)]
-    struct Guard {
-        anchors: Vec<PathBuf>,
-        readonly: Vec<PathBuf>,
-        /// The workspace, set only when writes are limited to `writable`.
-        #[serde(default)]
-        root: Option<PathBuf>,
-        #[serde(default)]
-        writable: Vec<PathBuf>,
-    }
-    /// Binds `path` onto itself; `recursive` keeps the mounts below it.
-    fn bind(path: &Path, recursive: bool) -> Result<()> {
-        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-        let flags = libc::MS_BIND | if recursive { libc::MS_REC } else { 0 };
-        if unsafe {
-            libc::mount(
-                path.as_ptr(),
-                path.as_ptr(),
-                std::ptr::null(),
-                flags,
-                std::ptr::null(),
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot establish protected mount boundary");
-        }
-        Ok(())
-    }
-    /// Makes the topmost mount at `path` read-only; mounts below it keep their flags.
-    fn remount_readonly(path: &Path) -> Result<()> {
-        let path = std::ffi::CString::new(path.as_os_str().as_encoded_bytes())?;
-        if unsafe {
-            libc::mount(
-                std::ptr::null(),
-                path.as_ptr(),
-                std::ptr::null(),
-                libc::MS_BIND
-                    | libc::MS_REMOUNT
-                    | libc::MS_RDONLY
-                    | libc::MS_NOSUID
-                    | libc::MS_NODEV,
-                std::ptr::null(),
-            )
-        } != 0
-        {
-            return Err(std::io::Error::last_os_error())
-                .context("cannot enforce read-only protected path");
-        }
-        Ok(())
-    }
-    let guard: Guard = serde_json::from_str(&std::env::var("JAIL_WRITE_GUARD")?)?;
+    let guard: jail::guard::Guard = serde_json::from_str(&std::env::var(jail::guard::ENV)?)?;
     for anchor in &guard.anchors {
-        bind(anchor, false)?;
+        sys::bind(anchor)?;
     }
     for path in &guard.readonly {
-        bind(path, false)?;
-        remount_readonly(path)?;
+        sys::bind(path)?;
+        sys::remount_readonly(path)?;
     }
-    if let Some(root) = &guard.root {
+    if let Some(limit) = &guard.limit {
         // Each writable path becomes its own mount, and recursive binds copy
         // the read-only mounts below it. Then the workspace mount, and every
         // anchor outside a writable path, turns read-only above them.
-        for path in &guard.writable {
-            bind(path, true)?;
+        for path in &limit.writable {
+            sys::bind_recursive(path)?;
         }
-        bind(root, true)?;
-        remount_readonly(root)?;
+        sys::bind_recursive(&limit.root)?;
+        sys::remount_readonly(&limit.root)?;
         for anchor in &guard.anchors {
-            if !guard.writable.iter().any(|w| anchor.starts_with(w)) {
-                remount_readonly(anchor)?;
+            if !limit.writable.iter().any(|w| anchor.starts_with(w)) {
+                sys::remount_readonly(anchor)?;
             }
         }
     }
     // Root gateway does not need mount privileges after initialization.
-    #[repr(C)]
-    struct Header {
-        version: u32,
-        pid: i32,
-    }
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct Data {
-        effective: u32,
-        permitted: u32,
-        inheritable: u32,
-    }
-    let mut header = Header {
-        version: 0x20080522,
-        pid: 0,
-    };
-    let mut data = [Data {
-        effective: 0,
-        permitted: 0,
-        inheritable: 0,
-    }; 2];
-    if unsafe { libc::syscall(libc::SYS_capget, &mut header, data.as_mut_ptr()) } != 0 {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    data[0].effective &= !(1 << 21);
-    data[0].permitted &= !(1 << 21);
-    data[0].inheritable &= !(1 << 21);
-    if unsafe { libc::syscall(libc::SYS_capset, &header, data.as_ptr()) } != 0
-        || unsafe { libc::prctl(libc::PR_CAPBSET_DROP, 21, 0, 0, 0) } != 0
-    {
-        return Err(std::io::Error::last_os_error().into());
-    }
-    Ok(())
+    sys::drop_sys_admin()
 }
 #[cfg(not(target_os = "linux"))]
 fn protect_paths() -> Result<()> {
@@ -380,7 +292,7 @@ fn import_auth(tool: &str) -> Result<()> {
     let (uid, gid) = identity()?;
     let value = read_auth()?;
     gateway::import(tool, &value)?;
-    drop_privileges(uid, gid)?;
+    sys::drop_privileges(uid, gid)?;
     secure_write(
         &path,
         &serde_json::to_vec(&gateway::placeholder(tool, &value))?,
@@ -388,7 +300,7 @@ fn import_auth(tool: &str) -> Result<()> {
     )
 }
 fn sync_auth(tool: &str) -> Result<()> {
-    if unsafe { libc::geteuid() } != 0 {
+    if !sys::is_root() {
         bail!("authentication update requires root");
     }
     let path = auth_path(tool)?;
@@ -399,7 +311,7 @@ fn sync_auth(tool: &str) -> Result<()> {
     if !gateway::sync(tool, &value)? {
         return Ok(());
     }
-    drop_privileges(uid, gid)?;
+    sys::drop_privileges(uid, gid)?;
     secure_write(
         &path,
         &serde_json::to_vec(&gateway::placeholder(tool, &value))?,
@@ -408,7 +320,7 @@ fn sync_auth(tool: &str) -> Result<()> {
 }
 fn prepare_auth() -> Result<()> {
     let (uid, gid) = identity()?;
-    drop_privileges(uid, gid)?;
+    sys::drop_privileges(uid, gid)?;
     for tool in ["claude", "codex"] {
         let path = auth_path(tool)?;
         if let Ok(meta) = fs::symlink_metadata(&path) {
@@ -482,28 +394,6 @@ fn launch(tool: &str, args: Vec<String>) -> Result<()> {
     } else {
         command.args(args);
     }
-    drop_privileges(uid, gid)?;
+    sys::drop_privileges(uid, gid)?;
     Err(command.exec().into())
-}
-#[cfg(target_os = "linux")]
-fn drop_privileges(uid: u32, gid: u32) -> Result<()> {
-    unsafe {
-        for capability in 0..=40 {
-            if libc::prctl(libc::PR_CAPBSET_DROP, capability, 0, 0, 0) != 0 {
-                return Err(std::io::Error::last_os_error().into());
-            }
-        }
-        if libc::setgroups(0, std::ptr::null()) != 0
-            || libc::setgid(gid) != 0
-            || libc::setuid(uid) != 0
-            || libc::prctl(libc::PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0
-        {
-            return Err(std::io::Error::last_os_error().into());
-        }
-    }
-    Ok(())
-}
-#[cfg(not(target_os = "linux"))]
-fn drop_privileges(_: u32, _: u32) -> Result<()> {
-    bail!("jail-guest runs only on Linux")
 }

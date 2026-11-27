@@ -1,0 +1,39 @@
+# Run with cargo-fuzz on nightly, for example:
+#   cargo +nightly fuzz run gateway_request
+[package]
+name = "jail-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+jail = { path = "..", features = ["fuzzing"] }
+libfuzzer-sys = "=0.4.13"
+
+# Keep this crate out of any workspace above it.
+[workspace]
+members = ["."]
+
+[[bin]]
+name = "gateway_request"
+path = "fuzz_targets/gateway_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "proxy_request"
+path = "fuzz_targets/proxy_request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "base64"
+path = "fuzz_targets/base64.rs"
+test = false
+doc = false
+bench = false

@@ -39,21 +39,11 @@ impl Client {
     pub fn delete_image(&self, tag: &str) -> Result<()> {
         self.checked(&["image", "delete", tag])
     }
-    /// Builds `context` as `tag`, showing the build output. `fresh` ignores
-    /// the build cache and pulls base images again.
-    pub fn build(
-        &self,
-        tag: &str,
-        build_args: &[(&str, String)],
-        fresh: bool,
-        context: &Path,
-    ) -> Result<()> {
+    /// Builds `context` as `tag`, showing the build output.
+    pub fn build(&self, tag: &str, build_args: &[(&str, String)], context: &Path) -> Result<()> {
         let mut args = vec!["build".to_owned(), "--tag".into(), tag.into()];
         for (key, value) in build_args {
             args.extend(["--build-arg".into(), format!("{key}={value}")]);
-        }
-        if fresh {
-            args.extend(["--no-cache".into(), "--pull".into()]);
         }
         args.push(context.to_string_lossy().into_owned());
         let status = self

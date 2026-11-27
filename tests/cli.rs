@@ -556,9 +556,9 @@ fn allow_write_sends_writable_paths_to_the_guest_and_conflicts_with_read_only() 
     )
     .unwrap();
     let root = workspace.canonicalize().unwrap();
-    assert_eq!(guard["root"], root.to_str().unwrap());
+    assert_eq!(guard["limit"]["root"], root.to_str().unwrap());
     assert_eq!(
-        guard["writable"],
+        guard["limit"]["writable"],
         serde_json::json!([root.join("out"), root.join("src")])
     );
     assert!(workspace.join("out").is_dir());

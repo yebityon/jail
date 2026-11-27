@@ -1,0 +1,40 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  host:
+    name: macOS host
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # Installs the release that rust-toolchain.toml names.
+      - run: rustup toolchain install
+      - run: cargo fmt --all --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo clippy --locked --lib --features fuzzing -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo build --locked --release --bin jail
+      # Fuzzing itself needs nightly and runs outside CI; this keeps the targets compiling.
+      - run: cargo check --locked --manifest-path fuzz/Cargo.toml
+
+  guest:
+    name: Linux guest
+    # The guest runs on arm64 Linux inside Apple container.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install
+      # Code under cfg(target_os = "linux") compiles only here.
+      - run: cargo clippy --locked --lib --bin jail-guest -- -D warnings
+      - run: cargo test --locked --lib --bin jail-guest
